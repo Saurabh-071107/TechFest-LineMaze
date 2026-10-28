@@ -27,7 +27,9 @@ float Kp = 0.06;
 float Ki = 0.0001;
 float Kd = 0.30;
 
-const unsigned long JUNCTION_COOLDOWN = 1000;
+const unsigned long MIN_JUNCTION_DEBOUNCE = 15; // Minimal 20ms debounce for tightly spaced junctions
+bool junctionArmed = true;
+uint8_t junctionClearCounter = 0;
 
 int lastError = 0;
 float integral = 0;
@@ -99,6 +101,8 @@ void pivot(bool turnToLeft) {
   integral = 0;
   lastError = 0;
   lastJunctionTime = millis();
+  junctionArmed = false;
+  junctionClearCounter = 0;
 }
 
 void turnAround() {
@@ -115,6 +119,8 @@ void turnAround() {
   integral = 0;
   lastError = 0;
   lastJunctionTime = millis();
+  junctionArmed = false;
+  junctionClearCounter = 0;
 }
 
 int readSensors(bool &hasLeft, bool &hasRight, bool &hasCross, bool &allWhite) {
@@ -174,13 +180,32 @@ void loop() {
 
   int error = readSensors(hasLeft, hasRight, hasCross, allWhite);
 
-  if ((hasLeft || hasRight || hasCross) && (lastJunctionTime == 0 || millis() - lastJunctionTime > JUNCTION_COOLDOWN)) {
+  // Spatial re-arming: re-arm as soon as outer sensors leave the intersection branch
+  if (!junctionArmed) {
+    bool outerClear = !isSensorOnLine(0) && !isSensorOnLine(1) && 
+                      !isSensorOnLine(5) && !isSensorOnLine(6);
+    if (outerClear && (millis() - lastJunctionTime > MIN_JUNCTION_DEBOUNCE)) {
+      junctionClearCounter++;
+      if (junctionClearCounter >= 1) { // 1 clean sample is enough to re-arm
+        junctionArmed = true;
+        junctionClearCounter = 0;
+      }
+    } else {
+      junctionClearCounter = 0;
+    }
+  }
+
+  if ((hasLeft || hasRight || hasCross) && junctionArmed) {
     setMotors(0, 0);
     delay(15);
     bool confL = false, confR = false, confCross = false, confWhite = false;
     readSensors(confL, confR, confCross, confWhite);
 
     if (confL || confR || confCross) {
+      junctionArmed = false;
+      junctionClearCounter = 0;
+      lastJunctionTime = millis();
+
       pauseAndBlink();
 
       setMotors(BASE_SPEED, BASE_SPEED);
@@ -198,6 +223,8 @@ void loop() {
         integral = 0;
         lastError = 0;
         lastJunctionTime = millis();
+        junctionArmed = false;
+        junctionClearCounter = 0;
       } else if (confL) {
         pivot(true);
       } else {
