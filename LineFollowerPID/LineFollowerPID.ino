@@ -130,22 +130,32 @@ void pivot(bool turnToLeft) {
 }
 
 void turnAround() {
-  // Spin 360 on the spot until middle sensor (S4 = index 3) gets the line
-  setMotors(-TURN_SPEED, TURN_SPEED);
+  // Determine spin direction toward side where line was last tracked
+  int leftSpeed  = (lastError > 0) ? TURN_SPEED  : -TURN_SPEED;
+  int rightSpeed = (lastError > 0) ? -TURN_SPEED : TURN_SPEED;
+  setMotors(leftSpeed, rightSpeed);
 
-  // 1. Initial spin off current position: wait until middle sensor (S4) leaves current line/dead-end
-  delay(140);
-  unsigned long t = millis();
-  while (isSensorOnLine(3) && (millis() - t < 300)) {
+  // 1. If middle sensor (S4) was initially on a line (e.g. dead-end), rotate until it leaves the line
+  if (isSensorOnLine(3)) {
+    unsigned long tClear = millis();
+    while (isSensorOnLine(3) && (millis() - tClear < 350)) {
+      delay(1);
+    }
   }
 
-  // 2. Spin 360 on the spot until middle sensor (S4 = index 3) gets the line
-  t = millis();
-  while (!isSensorOnLine(3) && (millis() - t < 3500)) {
+  // 2. Spin 360 on the spot continuously until middle sensor (S4 = index 3) locks onto the line
+  while (true) {
+    if (isSensorOnLine(3)) {
+      delay(2);
+      if (isSensorOnLine(3)) {
+        break; // Double-confirmed middle sensor is securely on the line
+      }
+    }
+    delay(1);
   }
 
-  // 3. Counter-torque brake to lock heading with middle sensor on line
-  setMotors(TURN_SPEED / 2, -TURN_SPEED / 2);
+  // 3. Active counter-torque braking to snap accurately onto heading with middle sensor on line
+  setMotors(-leftSpeed / 2, -rightSpeed / 2);
   delay(25);
   setMotors(0, 0);
   delay(20);
@@ -376,6 +386,24 @@ void loop() {
 
   int rawError = readSensors(hasLeft, hasRight, hasCross, allWhite, pattern);
 
+  // Line loss handling: when all sensors see white, rotate on the spot until middle sensor (S4) locks the line
+  static unsigned long lostLineStart = 0;
+  if (allWhite) {
+    if (lostLineStart == 0) {
+      lostLineStart = millis();
+    }
+    // Filter out 1-2 cycle optical seams (require ~25ms continuous white to declare true line loss)
+    if (millis() - lostLineStart > 25) {
+      turnAround(); // Spin 360 on the spot until middle sensor (S4) locks onto the line
+      lostLineStart = 0;
+      return;
+    }
+    // During the 25ms seam filter: coast straight gently without turning or accelerating into white space
+    setMotors(BASE_SPEED / 2, BASE_SPEED / 2);
+    return;
+  }
+  lostLineStart = 0;
+
   // 6-reading data protection: outlier rejection, PID error smoothing & junction consistency
   bool junctionSupported = false;
   int error = applyDataProtection(rawError, pattern, junctionSupported);
@@ -440,20 +468,6 @@ void loop() {
       digitalWrite(PIN_LED, LOW);
       return;
     }
-  }
-
-  // Line loss protection: requires 100ms continuous allWhite to eliminate false turns on straight line
-  static unsigned long lostLineStart = 0;
-  if (allWhite) {
-    if (lostLineStart == 0) {
-      lostLineStart = millis();
-    } else if (millis() - lostLineStart > 100) {
-      turnAround(); // Spin 360 on the spot until middle sensor gets the line
-      lostLineStart = 0;
-      return;
-    }
-  } else {
-    lostLineStart = 0; // Resets immediately when any sensor is on line
   }
 
   if (abs(error) > 40) {
