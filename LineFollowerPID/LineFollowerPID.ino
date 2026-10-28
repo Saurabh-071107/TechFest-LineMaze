@@ -103,15 +103,17 @@ void pivot(bool turnToLeft) {
 
   setMotors(leftSpeed, rightSpeed);
 
-  // 1. Initial spin off current line: wait until middle sensor (S4) completely leaves old line
-  delay(140);
+  // 1. Initial 50ms unstick spin to clear center sensor S4 off previous orientation
+  delay(50);
   unsigned long t = millis();
-  while (isSensorOnLine(3) && (millis() - t < 300)) {
+  while (isSensorOnLine(3) && (millis() - t < 120)) {
+    delay(1);
   }
 
-  // 2. Turn completely until the main line reaches the middle sensor (S4 = index 3)
+  // 2. Rotate until center sensor (S4 = index 3) acquires the arriving 90° branch
   t = millis();
-  while (!isSensorOnLine(3) && (millis() - t < 1000)) {
+  while (!isSensorOnLine(3) && (millis() - t < 800)) {
+    delay(1);
   }
 
   // 3. Active counter-torque braking to snap accurately onto heading with middle sensor on line
@@ -135,18 +137,18 @@ void turnAround() {
   int rightSpeed = (lastError > 0) ? -TURN_SPEED : TURN_SPEED;
   setMotors(leftSpeed, rightSpeed);
 
-  // 1. If middle sensor (S4) was initially on a line (e.g. dead-end), rotate until it leaves the line
-  if (isSensorOnLine(3)) {
-    unsigned long tClear = millis();
-    while (isSensorOnLine(3) && (millis() - tClear < 350)) {
-      delay(1);
-    }
+  // 1. Initial spin to clear dead-end orientation (min 80ms)
+  delay(80);
+  unsigned long t = millis();
+  while (isSensorOnLine(3) && (millis() - t < 200)) {
+    delay(1);
   }
 
-  // 2. Spin 360 on the spot continuously until middle sensor (S4 = index 3) locks onto the line
-  while (true) {
+  // 2. Spin on the spot until middle sensor (S4 = index 3) locks onto the return line
+  t = millis();
+  while (millis() - t < 1500) {
     if (isSensorOnLine(3)) {
-      delay(2);
+      delay(3);
       if (isSensorOnLine(3)) {
         break; // Double-confirmed middle sensor is securely on the line
       }
@@ -188,45 +190,26 @@ int readSensors(bool &hasLeft, bool &hasRight, bool &hasCross, bool &allWhite, u
 
   outPattern = pattern;
 
-  // --- D. Recovery and Unusual Patterns ---
-  // Pattern 23: 0000000 - Possible line loss / dead end
   allWhite = (pattern == 0b0000000);
 
-  // Pattern 24 (1000001) & Pattern 25 (1010101): Noise / unusual patterns
   if (pattern == 0b1000001 || pattern == 0b1010101) {
     hasLeft = false;
     hasRight = false;
     hasCross = false;
-    return lastError; // Reject transient noise; hold previous steering
+    return lastError;
   }
 
-  bool leftWing     = (pattern & 0b1100000) != 0; // S1 or S2
-  bool rightWing    = (pattern & 0b0000011) != 0; // S6 or S7
-  bool centerOnLine = (pattern & 0b0011100) != 0; // S3, S4, or S5
+  bool leftBranch  = ((pattern & 0b1000000) != 0) && ((pattern & 0b0110000) != 0);
+  bool rightBranch = ((pattern & 0b0000001) != 0) && ((pattern & 0b0000110) != 0);
 
-  // --- C. Junction and Intersection Candidates ---
-  // Pattern 20: 1111111 (all sensors active)
-  // Pattern 21: 1110111 (broad intersection)
-  // Pattern 22: 1100110 (two separated black regions)
-  // Pattern 18: 1111100 (broad left-side junction)
-  // Pattern 19: 0011111 (broad right-side junction)
-  // Pattern 12: 1111000 (wide left curve/branch)
-  // Pattern 13: 0001111 (wide right curve/branch)
-  // Pattern 16: 1101000 (irregular left bend)
-  // Pattern 17: 0001011 (irregular right bend)
-  hasCross = (pattern == 0b1111111) || (pattern == 0b1110111) || (pattern == 0b1100110) ||
-             (leftWing && rightWing && centerOnLine) || (activeCount >= 5);
+  hasCross = (leftBranch && rightBranch) || (pattern == 0b1111111) || (pattern == 0b1110111) ||
+             (activeCount >= 5 && ((pattern & 0b1000000) != 0) && ((pattern & 0b0000001) != 0));
 
-  hasRight = (pattern == 0b0011111) || (pattern == 0b0001111) || (pattern == 0b0001011) ||
-             (pattern == 0b0000111) || (rightWing && centerOnLine && !hasCross);
+  hasRight = rightBranch && !hasCross;
+  hasLeft  = leftBranch && !hasCross;
 
-  hasLeft  = (pattern == 0b1111100) || (pattern == 0b1111000) || (pattern == 0b1101000) ||
-             (pattern == 0b1110000) || (leftWing && centerOnLine && !hasCross);
-
-  // --- A & B. Normal Line Following & Continuous Tracking ---
   if (totalActive > 0) {
     int continuousError = (int)(weightedSum / totalActive);
-    // Center deadband (±40 units) to keep the nose locked dead straight without twitching
     if (abs(continuousError) < 40) {
       continuousError = 0;
     }
@@ -275,14 +258,13 @@ int applyDataProtection(int rawError, uint8_t rawPattern, bool &junctionSupporte
   }
   int smoothedError = sum / errorHistCount;
 
-  // 5. Junction Data Protection: check if recent history confirms junction candidate
+  // 5. Junction Data Protection: check if recent history confirms genuine branch candidate
   uint8_t junctionVotes = 0;
   for (uint8_t i = 0; i < errorHistCount; i++) {
     uint8_t p = patternHistory[i];
-    bool hasLeftFeature  = (p & 0b1100000) != 0;
-    bool hasRightFeature = (p & 0b0000011) != 0;
-    bool hasCenter       = (p & 0b0011100) != 0;
-    if ((hasLeftFeature || hasRightFeature) && hasCenter) {
+    bool hasLeftFeature  = ((p & 0b1000000) != 0) && ((p & 0b0110000) != 0);
+    bool hasRightFeature = ((p & 0b0000001) != 0) && ((p & 0b0000110) != 0);
+    if (hasLeftFeature || hasRightFeature || (p == 0b1111111)) {
       junctionVotes++;
     }
   }
@@ -386,19 +368,19 @@ void loop() {
 
   int rawError = readSensors(hasLeft, hasRight, hasCross, allWhite, pattern);
 
-  // Line loss handling: when all sensors see white, rotate on the spot until middle sensor (S4) locks the line
+  // Line loss handling: when all sensors see white, filter seams/gaps before declaring true dead end
   static unsigned long lostLineStart = 0;
   if (allWhite) {
     if (lostLineStart == 0) {
       lostLineStart = millis();
     }
-    // Filter out 1-2 cycle optical seams (require ~25ms continuous white to declare true line loss)
-    if (millis() - lostLineStart > 25) {
-      turnAround(); // Spin 360 on the spot until middle sensor (S4) locks onto the line
+    // Filter optical seams/gaps: require 120ms continuous white before declaring true dead end
+    if (millis() - lostLineStart > 120) {
+      turnAround(); // True dead end confirmed -> 180° U-turn
       lostLineStart = 0;
       return;
     }
-    // During the 25ms seam filter: coast straight gently without turning or accelerating into white space
+    // During seam debounce: coast straight ahead smoothly without turning or accelerating into white space
     setMotors(BASE_SPEED / 2, BASE_SPEED / 2);
     return;
   }
@@ -434,36 +416,42 @@ void loop() {
 
       digitalWrite(PIN_LED, HIGH);
 
-      // Track branches observed before and DURING the inch
-      bool seenRight = hasRight || hasCross || confR || confCross || isSensorOnLine(5) || isSensorOnLine(6);
-      bool seenLeft  = hasLeft  || hasCross || confL || confCross || isSensorOnLine(0) || isSensorOnLine(1);
+      // Track genuine branches observed upon arrival
+      bool branchRight = hasRight || hasCross || confR || confCross || (isSensorOnLine(6) && isSensorOnLine(5));
+      bool branchLeft  = hasLeft  || hasCross || confL || confCross || (isSensorOnLine(0) && isSensorOnLine(1));
 
-      // Smooth inching to align drive axle over junction node while actively sampling wings
+      // Inching forward to align drive axle over junction node while actively sampling wings
       setMotors(BASE_SPEED, BASE_SPEED);
       unsigned long tInch = millis();
       while (millis() - tInch < INCH_TIME) {
-        if (isSensorOnLine(5) || isSensorOnLine(6)) seenRight = true;
-        if (isSensorOnLine(0) || isSensorOnLine(1)) seenLeft  = true;
+        if (isSensorOnLine(6) && isSensorOnLine(5)) branchRight = true;
+        if (isSensorOnLine(0) && isSensorOnLine(1)) branchLeft  = true;
       }
 
-      bool straightAhead = isSensorOnLine(1) || isSensorOnLine(2) || isSensorOnLine(3) || 
-                           isSensorOnLine(4) || isSensorOnLine(5);
+      // Active brake to kill forward momentum directly over junction node before decision
+      setMotors(-BASE_SPEED / 2, -BASE_SPEED / 2);
+      delay(20);
+      setMotors(0, 0);
+      delay(15);
+
+      // Evaluate straight ahead path using center sensors S3, S4, S5 (indices 2, 3, 4)
+      bool straightAhead = isSensorOnLine(2) || isSensorOnLine(3) || isSensorOnLine(4);
 
       // STRICT PRIORITY: RIGHT -> STRAIGHT -> LEFT -> U-TURN
-      if (seenRight) {
-        pivot(false); // Turn Right (Priority 1)
+      if (branchRight) {
+        pivot(false); // Priority 1: Turn Right
       } else if (straightAhead) {
-        setMotors(BASE_SPEED, BASE_SPEED); // Go Straight (Priority 2)
-        delay(80);
+        setMotors(BASE_SPEED, BASE_SPEED); // Priority 2: Go Straight
+        delay(60);
         integral = 0;
         lastError = 0;
         lastJunctionTime = millis();
         junctionArmed = false;
         junctionClearCounter = 0;
-      } else if (seenLeft) {
-        pivot(true);  // Turn Left (Priority 3)
+      } else if (branchLeft) {
+        pivot(true);  // Priority 3: Turn Left
       } else {
-        turnAround(); // U-Turn (Priority 4)
+        turnAround(); // Priority 4: U-Turn (Dead End)
       }
       digitalWrite(PIN_LED, LOW);
       return;
