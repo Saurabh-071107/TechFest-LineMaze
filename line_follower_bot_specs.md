@@ -1,6 +1,6 @@
-# Line-Follower Robot — Technical Specifications & Operations Manual
+# Line-Follower & Maze-Solver Robot — Technical Specifications & Operations Manual
 
-An authoritative engineering specification and operational manual for the high-speed autonomous line-follower and maze-solving robot driven by an **Arduino Nano**, **Robo Junkies 7-Array Analog Sensor**, and **TB6612FNG Dual H-Bridge Motor Driver**.
+An authoritative engineering specification and operational manual for the autonomous line-follower and Graph-DFS maze-solving robot driven by an **Arduino Nano**, **Robo Junkies 7-Array Analog Sensor**, **TB6612FNG Dual H-Bridge Motor Driver**, and **Pin D10 Mode Control Button**.
 
 ---
 
@@ -16,9 +16,10 @@ graph TD
         GND["Common Ground Bus"]
     end
 
-    subgraph Controller ["Processing Unit"]
+    subgraph Controller ["Processing & User Interface"]
         NANO["Arduino Nano (ATmega328P @ 16MHz)"]
-        EEPROM["Internal EEPROM (Calib Data 0x5446)"]
+        EEPROM["Internal EEPROM (Calib 0x5446 + Path 0x5046)"]
+        BTN["D10 Push-Button (INPUT_PULLUP)"]
         LED["D13 Status / Junction LED"]
     end
 
@@ -40,8 +41,10 @@ graph TD
     GND --- NANO
     GND --- TB
     GND --- SENSOR
+    GND --- BTN
 
     SENSOR -->|A0–A6| NANO
+    BTN -->|D10 Active LOW| NANO
     NANO -->|D3, D4, D5 (PWMA)| TB
     NANO -->|D7, D9, D6 (PWMB)| TB
     NANO -->|D8 (STBY)| TB
@@ -56,15 +59,17 @@ graph TD
 
 | Parameter | Specification | Notes |
 |---|---|---|
-| **Robot Type** | Autonomous Line Follower / Maze Solver | Differential drive, closed-loop PID control |
+| **Robot Type** | Autonomous Line Follower & Graph-DFS Maze Solver | Dual-profile closed-loop PID (`Dry Run = 145`, `Final Run = 175`) |
 | **Main Controller** | Arduino Nano (ATmega328P @ 16 MHz) | 5V logic level |
-| **Perception Array** | Robo Junkies 7-Array Analog Sensor | Phototransistor/IR reflectance array |
+| **Perception Array** | Robo Junkies 7-Array Analog Sensor | Phototransistor/IR reflectance array (`A0–A6`) |
 | **Motor Driver** | TB6612FNG Dual H-Bridge IC | MOSFET-based, low voltage drop, PWM capable |
 | **Actuators** | 2 × N20 Micro Metal Gearmotors | 6V rated, 300 RPM nominal speed |
+| **Control Input** | Push-Button on **Pin D10** (`PIN_BTN = 10`) | `1 Press` = Calibrate, `2 Presses` = Dry Run, `3 Presses` = Short Run |
 | **Chassis Total Length** | 21 cm | Front sensor tip to rear chassis boundary |
 | **Line Polarity** | Black line on white surface (Default) | Invertible in firmware (`BLACK_LINE = true/false`) |
-| **Junction Algorithm** | Right-Hand Rule (R-S-L-U Priority) | Right $\rightarrow$ Straight $\rightarrow$ Left $\rightarrow$ U-Turn |
-| **Wireless Module** | None | Fully self-contained autonomous operation |
+| **Exploration Algorithm** | Loop-Aware Right-Priority Graph-DFS | `Right > Straight > Left > Back` preferring unvisited edges + 4-R cycle breaker |
+| **Shortest Path Engine** | Unified $\Delta H$ Stack Pruning + Dijkstra | Solves both dead-ends (`RBR->S`, `RBS->L`, etc.) and multi-path loops |
+| **Finish Detection** | 3 Consecutive Back-to-Back T-Junctions | Triggered when `tJunctionCount >= 3` within `maxTJunctionGap` |
 
 ---
 
@@ -88,12 +93,13 @@ graph TD
 | **D7** | Digital I/O | TB6612FNG **BIN1** | Left Motor Direction In 1 | HIGH/LOW logic |
 | **D8** | Digital I/O | TB6612FNG **STBY** | Driver Standby Enable | HIGH = Enabled, LOW = High-Z |
 | **D9** | PWM (OC1A) / Digital I/O | TB6612FNG **BIN2** | Left Motor Direction In 2 | HIGH/LOW logic |
-| **D13** | Built-in LED (SCK) | Onboard LED | Junction & Calibration indicator | HIGH = On, LOW = Off |
+| **D10** | Digital I/O (`INPUT_PULLUP`) | Mode Push-Button (`PIN_BTN`) | Mode Selection & Emergency Stop | `LOW` = Pressed (tied to GND) |
+| **D13** | Built-in LED (SCK) | Onboard LED (`PIN_LED`) | Junction, Standby & Mode indicator | HIGH = On, LOW = Off |
 | **5V** | Regulated Output / Input | Sensor VCC, Driver VCC | Logic Power Rail | 5.0 V DC |
 | **GND** | System Ground | Common Ground | Reference ground bus | 0 V common |
 
 > [!IMPORTANT]
-> **A6 Limitation:** On the ATmega328P (TQFP package), pin **A6** is wired strictly to the ADC multiplexer. It does **not** contain digital input buffers or output drivers. It must be read using `analogRead(A6)` and cannot be used with `digitalRead()`, `digitalWrite()`, or `pinMode()`.
+> **A6 Limitation:** On the ATmega328P (TQFP package), pin **A6** is wired strictly to the ADC multiplexer. It must be read using `analogRead(A6)` and cannot be used with `digitalRead()`.
 
 ---
 
@@ -101,7 +107,7 @@ graph TD
 
 ### 3.1 Sensor Array Layout & Weights
 
-The 7-channel reflectance array provides lateral line displacement information. Each sensor channel is assigned an integer geometric weight relative to the robot's centerline ($S4 = 0$):
+Each sensor channel is assigned an integer geometric weight relative to the robot's centerline ($S4 = 0$):
 
 ```
        [ Left Wing ]                 [ Center ]                 [ Right Wing ]
@@ -111,191 +117,100 @@ Bit:      6        5        4            3            2        1        0
 Weight: -3000    -2000    -1000          0         +1000    +2000    +3000
 ```
 
-### 3.2 Detection Logic & Error Calculation
+### 3.2 Detection Logic & Error Calculation (`readSensors`)
 
-1. **Thresholding:**
-   $$\text{isOnLine}(i) = \begin{cases} \text{raw}_i > \text{threshold}_i & \text{if } \text{BLACK\_LINE} = \text{true} \\ \text{raw}_i < \text{threshold}_i & \text{if } \text{BLACK\_LINE} = \text{false} \end{cases}$$
+1. **Thresholding (`isOnLine`):**
+   $$\text{isOnLine}(i) = \begin{cases} \text{raw}_i > \text{sensorThreshold}_i & \text{if } \text{BLACK\_LINE} = \text{true} \\ \text{raw}_i < \text{sensorThreshold}_i & \text{if } \text{BLACK\_LINE} = \text{false} \end{cases}$$
 2. **Bitmask Register:**
-   $$\text{Pattern} = \sum_{i=0}^{6} (\text{isOnLine}(i) \ll (6 - i))$$
+   $$\text{pattern} = \sum_{i=0}^{6} (\text{isOnLine}(i) \ll (6 - i))$$
 3. **Continuous Weighted Center-of-Mass Error:**
-   $$\text{Error} = \frac{\sum_{i=0}^{6} \text{ActiveVal}_i \times \text{Weight}_i}{\sum_{i=0}^{6} \text{ActiveVal}_i}$$
-   where $\text{ActiveVal}_i = |\text{raw}_i - \text{threshold}_i|$.
-4. **Deadband Filter:** If $|\text{Error}| < 40$, the error is rounded to $0$ to eliminate jitter around the centerline.
+   $$\text{continuousError} = \frac{\sum_{i=0}^{6} \text{activeVal}_i \times \text{SENSOR\_WEIGHTS}_i}{\sum_{i=0}^{6} \text{activeVal}_i}$$
+   where $\text{activeVal}_i = |\text{raw}_i - \text{sensorThreshold}_i|$.
+4. **Deadband & Anomaly Filter:**
+   - If $|\text{continuousError}| < 40$, error is clamped to $0$.
+   - Optical anomalies `0b1000001` and `0b1010101` are rejected and return `lastError`.
 
 ---
 
 ## 4. Actuation Subsystem: TB6612FNG & N20 Motors
 
-### 4.1 TB6612FNG Truth Table
+### 4.1 TB6612FNG Truth Table (`setMotor` / `setMotors`)
 
 | STBY | IN1 (D3 / D7) | IN2 (D4 / D9) | PWM (D5 / D6) | Out 1 / Out 2 | Operational Mode |
 |:---:|:---:|:---:|:---:|:---:|---|
-| **H** | **H** | **L** | **PWM** | $H / L$ | **Forward Motion** (Speed governed by PWM duty cycle) |
-| **H** | **L** | **H** | **PWM** | $L / H$ | **Reverse Motion** (Speed governed by PWM duty cycle) |
-| **H** | **L** | **L** | **X** | High-Z | **Coast** (Inertial deceleration) |
-| **H** | **H** | **H** | **X** | $L / L$ | **Short Brake** (Dynamic counter-EMF damping) |
-| **L** | **X** | **X** | **X** | High-Z | **Standby** (Ultra-low power shutdown mode) |
-
-### 4.2 Motor Channels & Polarity Mapping
-
-| Subsystem | Driver Inputs | Driver Outputs | Connected Actuator | Inversion Flag in Code |
-|---|---|---|---|---|
-| **Right Motor** | AIN1 (D3), AIN2 (D4), PWMA (D5) | AO1, AO2 | Right N20 Motor (6V 300 RPM) | `INVERT_RIGHT_MOTOR = false` |
-| **Left Motor** | BIN1 (D7), BIN2 (D9), PWMB (D6) | BO1, BO2 | Left N20 Motor (6V 300 RPM) | `INVERT_LEFT_MOTOR = false` |
-
-> [!TIP]
-> If a motor spins opposite to the intended forward direction, either flip the motor output leads (AO1/AO2 or BO1/BO2) or set the corresponding inversion flag to `true` in firmware.
+| **H** | **H** | **L** | **PWM** | $H / L$ | **Forward Motion** (`speed > 0`) |
+| **H** | **L** | **H** | **PWM** | $L / H$ | **Reverse Motion** (`speed < 0`) |
+| **H** | **L** | **L** | **0** | High-Z | **Stop / Coast** (`speed == 0`) |
+| **L** | **X** | **X** | **X** | High-Z | **Standby** |
 
 ---
 
-## 5. Power Distribution & Ground Architecture
+## 5. Firmware Architecture & Dual-Mode Control Profiles
 
-### 5.1 Power Routing Schematic
+### 5.1 Dual Mode-Specific Speed, Timing & PID Profiles (`applySpeedProfile`)
 
-```
-[ 6V Regulated Motor Battery / Buck ] ───────────────> TB6612FNG VM (Motor Power)
-[ 5V Regulated Logic Supply ] ─────────┬─────────────> Arduino Nano 5V
-                                       ├─────────────> TB6612FNG VCC (Logic Power)
-                                       └─────────────> Robo Junkies Sensor VCC
+The firmware automatically switches all speed, PID, filter, braking, and timing parameters depending on whether it is executing the **Dry Run (`MODE_DRY_RUN`)** or the **Final Shortest-Path Run (`MODE_SPEED_RUN`)**:
 
-[ Common Ground Bus ] ─────────────────┴─────────────> Tied to Arduino GND, Driver GND,
-                                                       Sensor GND, Battery Negative
-```
+| Parameter | Dry Run (`MODE_DRY_RUN`) | Final Run (`MODE_SPEED_RUN`) | Engineering Purpose |
+| :--- | :---: | :---: | :--- |
+| **`baseSpeed`** | `145` | **`175`** | Nominal straight-line cruise PWM |
+| **`maxSpeed`** | `210` | **`240`** | Upper PWM clamp during steering corrections |
+| **`turnSpeed`** | `125` | **`145`** | Differential pivot speed for 90° and 180° turns |
+| **`Kp`** | `0.048` | **`0.058`** | Proportional gain ($\text{Kp} \times 3000 \approx \text{baseSpeed}$) |
+| **`Ki`** | `0.00005` | **`0.00004`** | Integral gain |
+| **`Kd`** | `0.22` | **`0.28`** | Derivative damping gain |
+| **`integralClamp`** | `±1500` | **`±1200`** | Anti-windup integral accumulator limit |
+| **`activeHistoryLen`** | `6` | **`5`** | Moving-average window length in `applyDataProtection()` |
+| **`slewDevMax` / `slewStep`** | `1800` / `1200` | **`2000` / `1400`** | Single-sample outlier slew-rate limiter |
+| **`inchTime` / `inchBrakeMs`** | `220 ms` / `25 ms` | **`180 ms` / `30 ms`** | Forward inching duration & reverse counter-brake pulse |
+| **`pivot()` Timings** | `100 / 150 / 1200 / 30 / 30 ms` | **`85 / 130 / 1000 / 35 / 25 ms`** | Unstick / Clear S4 / Acquire S4 / Reverse Brake / Settle |
+| **`straightClearMs`** | `60 ms` | **`50 ms`** | Forward drive boost in `driveStraightPastJunction()` |
+| **`deadEndTimeoutMs`** | `100 ms` | **`80 ms`** | `allWhite` duration before triggering 180° turnaround |
+| **`minJunctionDebounce` / `rearmFallbackMs`** | `15 ms` / `120 ms` | **`12 ms` / `95 ms`** | Post-junction re-arming gates |
+| **`maxTJunctionGap`** | `750 ms` | **`650 ms`** | Maximum window between consecutive T-junctions for Finish Box |
+| **`sweep360Time` / `sweepBrakeMs`** | `3800 ms` / `28 ms` | **`3300 ms` / `32 ms`** | 360° line search timeout and lock counter-brake |
+| **`odomDivisor`** | `40 ms/unit` | **`33 ms/unit`** | Time-odometry divisor for graph coordinate mapping |
 
-### 5.2 Critical Power Guidelines
-1. **Never power motors from the Arduino 5V regulator:** The ATmega328P on-board linear regulator cannot deliver the high current surges (0.5A–1.5A stall per motor) required by N20 gear motors, which causes brownout resets.
-2. **Dedicated Motor Supply (VM):** The TB6612FNG **VM** pin must receive a stable, high-discharge 6V supply.
-3. **Common Ground:** All subsystems (Battery, Arduino Nano, TB6612FNG, and Robo Junkies sensor) must share a common ground bus to prevent signal floating and ADC reference distortion.
+### 5.2 Graph-DFS Exploration & Shortest-Path Solver
 
----
-
-## 6. Mechanical & Kinematic Specifications
-
-| Parameter | Dimension / Value | Engineering Context |
-|---|---|---|
-| **Total Bot Length** | 21 cm | Front sensor array overhang to rear bumper |
-| **Motor Type** | N20 Micro DC Metal Gearmotor | High torque miniature gearhead |
-| **Rated Operating Voltage** | 6.0 V DC | Safe operational range: 3.0V – 9.0V |
-| **Nominal Output Speed** | 300 RPM @ 6V | Provides balanced linear speed vs torque for maze solving |
-| **Drive Architecture** | 2-Wheel Differential Drive | Independent left/right motor speed steering |
-| **Support Wheel / Skid** | Front/Rear Low-Friction Castor or Ball Skid | Maintains chassis level and stable pitch |
-| **Recommended Sensor Clearance** | 3 mm to 5 mm above track surface | Optimal focal distance for IR phototransistors |
-| **Sensor-to-Axle Offset** | Leading cantilever (~10–12 cm) | Gives early junction detection before axle reaches node |
-
----
-
-## 7. Firmware Architecture & Control Algorithms
-
-### 7.1 PID Speed & Steering Constants
-
-| Constant | Value | Role & Behavioral Function |
-|---|:---:|---|
-| `BASE_SPEED` | `145` | Nominal cruise speed (PWM range 0–255) |
-| `MAX_SPEED` | `210` | Clamped upper ceiling for motor PWM duty cycle |
-| `TURN_SPEED` | `125` | In-place spin speed during pivot and 180° turns |
-| `INCH_TIME` | `120 ms` | Forward creep time to position drive axle directly over junction node |
-| `Kp` | `0.048` | Proportional gain: immediate corrective steering response |
-| `Ki` | `0.00005` | Integral gain: eliminates steady-state drift; clamped to $\pm 1500$ |
-| `Kd` | `0.22` | Derivative gain: damps overshoot and prevents high-speed oscillation |
-
-$$\text{Correction} = K_p \times \text{Error} + K_i \times \int \text{Error} \, dt + K_d \times \frac{d(\text{Error})}{dt}$$
-$$\text{Speed}_{\text{Left}} = \text{constrain}(\text{BASE\_SPEED} + \text{Correction}, -\text{MAX\_SPEED}, \text{MAX\_SPEED})$$
-$$\text{Speed}_{\text{Right}} = \text{constrain}(\text{BASE\_SPEED} - \text{Correction}, -\text{MAX\_SPEED}, \text{MAX\_SPEED})$$
-
-### 7.2 6-Reading Data Protection & Anti-Jitter Filter
-
-To eliminate single-cycle optical glitches from floor reflections or tape seams:
-1. **Circular Buffer:** Stores the last 6 consecutive readings of `error` and `pattern`.
-2. **Outlier Rejection:** If the deviation between the current raw error and the 6-sample moving average exceeds $\pm 1800$, it is clamped to $\pm 1200$.
-3. **Error Smoothing:** The PID controller steering input uses the 6-sample moving average, guaranteeing smooth, twitch-free navigation.
-4. **Junction Vote Confirmation:** An intersection trigger requires $\ge 2$ positive confirmations in recent history (`junctionSupported = true`).
-
-### 7.3 Maze Navigation Decision Hierarchy (Right-Hand Rule)
-
-When an intersection is validated, the robot follows a strict priority and precision stopping procedure:
-
-```
-[ Intersection Detected ]
-          │
-          ▼
-   [ Inch Forward 120 ms ]       --> Positions drive axle directly over node
-          │
-          ▼
-[ Active Counter-Brake 25 ms ]   --> Eliminates forward momentum
-          │
-          ▼
- [ Full Stop & Triple-Strobe ]   --> Settle pause + 3 rapid blinks (~135ms) to signal node
-          │
-          ├──> 1. Right Branch Available? ──> Precision Pivot Right (Priority 1)
-          │
-          ├──> 2. Straight Path Exists?   ──> Drive Straight (Priority 2)
-          │
-          ├──> 3. Left Branch Available?  ──> Precision Pivot Left (Priority 3)
-          │
-          └──> 4. All White / No Exit?    ──> 360° Search & Stop if Not Found (Priority 4)
-```
-
-- **S4 Precision 90° Turn:** During pivots, the perception subsystem focuses exclusively on locking center sensor **S4** (pin A3) onto the incoming branch. The moment S4 confirms line acquisition, an active counter-torque reverse burst (28 ms at half-speed) snaps the robot onto the new heading without inertial overshoot.
-- **Consecutive Junction Re-Arming:** To reliably handle junctions in tight succession (within 5–10 cm of each other), the re-arming logic uses a dual condition: outer sensors ($S1, S2, S6, S7$) cleared with $> 15\text{ ms}$ debounce, OR a failsafe timer ($> 120\text{ ms}$) while middle sensor S4 is securely tracking the line.
-- **360° Differential Line Search & Failsafe Stop:** When all sensors detect white continuously for $> 100\text{ ms}$ (filtering tape seams), the robot initiates a 360° differential spin search towards the last-tracked error side. If the line is re-acquired during the sweep, it locks S4 and resumes PID tracking. If the full 360° rotation completes without detecting a line, motors are immediately cut (`setMotors(0, 0)`) and an alert heartbeat LED signals a safe stop state.
-
-### 7.4 Online Adaptive Calibration using Sliding Window
-
-To compensate for gradual changes in surface reflectivity, thermal drift, and battery voltage degradation:
-1. **3-Sample Sliding Window:** Keeps the last 3 samples (`rawHistory[i][0..2]`) per channel to detect signal stability ($|\Delta| \le 30$ counts) and reject sudden edges or spikes.
-2. **Safety Gate (`calibrationAllowed`):**
-   - Active only when 1 to 3 sensors track the line.
-   - Frozen on junctions (`hasLeft`, `hasRight`, `hasCross`), line loss (`allWhite`), or during post-turn debounce ($< 250\text{ ms}$).
-   - Frozen when lateral tracking error $> 800$.
-3. **Bounded EMA Adaptation:** Updates min/max envelopes with an Exponential Moving Average ($\alpha = 0.01$).
-4. **Hard Guards:** Thresholds are clamped to $\pm 120$ counts of initial calibration, with minimum contrast span $\ge 160$ counts. Zero EEPROM writes during navigation loop to protect flash endurance.
+1. **Compass Heading & Time-Odometry Graph (`nodes[28]`):**
+   - Tracks drift-free compass heading `currentHeading` $\in \{0=\text{N}, 1=\text{E}, 2=\text{S}, 3=\text{W}\}$ and estimated grid coordinates `(curX, curY)` using elapsed segment travel time `segCost = (millis() - segmentStartTime) / odomDivisor`.
+   - `findOrCreateNode()` matches revisited junctions within `SNAP_RADIUS = 12` when topology overlaps, snapping `(curX, curY)` to cancel drift and linking bidirectional weighted edges.
+   - After any 180° dead-end turnaround (`recordDeadEnd()`), `lastTurnWasBack = true` guarantees the next junction snaps directly back to `currentNode`.
+2. **Loop-Safe Right-Priority Selection:**
+   - At every junction in `MODE_DRY_RUN`, available branches are evaluated in **`Right > Straight > Left`** order:
+     - **Pass 1:** Selects the highest-priority **unvisited** exit (`visitedMask`).
+     - **Pass 2:** Falls back to standard `R > S > L` if all exits have been visited.
+     - **Cycle-Breaker Guard:** If `consecutiveRightTurns >= 4` ($+360^\circ$ loop) and Straight or Left is available, Right is blocked to break out of closed island loops.
+3. **In-Flight Reduction (`recordAndReduceTurn` & `collapseBStack`) + Dijkstra (`computeShortestPath`):**
+   - Collapses dead-end `'B'` sequences (`RBR -> S`, `RBS -> L`, `SBR -> L`, `LBR -> B`, `RBL -> B`, `SBS -> B`) and revisited-node sub-loops in real time using `dirsToTurn(origIn, curOut)`.
+   - At the Finish Box, `computeShortestPath()` extracts the pruned stack up to `preFinishStackLen` (ignoring the Finish Box bars themselves), runs Dijkstra across `nodes[]` from `Node 0` to `preFinishNode` to upgrade `shortestPath[]` if a faster multi-path shortcut exists, and persists the result to `EEPROM` (`StoredPath`, magic `0x5046`).
 
 ---
 
-## 8. Calibration & Operating Lifecycle
+## 6. How to Operate the Robot (`PIN_BTN = D10`)
+
+When the robot is powered on or stopped in Standby (`waitForButtonCommand`), the onboard LED (`D13`) gives a short heartbeat flash every `0.8 seconds`:
 
 ```mermaid
-sequenceDiagram
-    participant User as Operator
-    participant Bot as Arduino Nano
-    participant Motor as TB6612FNG & Motors
-    participant Sensor as Robo Junkies 7-Array
-    participant EE as EEPROM
-
-    User->>Bot: Power On (Switch Closed)
-    Bot->>Bot: Load stored thresholds from EEPROM (Magic 0x5446)
-    Bot->>User: 2-Second Placement Countdown (8 fast LED flashes)
-    Bot->>Motor: Start 4000 ms 360° In-Place Rotation
-    loop 4000 ms Calibration
-        Sensor->>Bot: Sample min/max values on all 7 channels
-        Bot->>User: LED fast strobe (70ms)
-    end
-    Bot->>Motor: Stop Motors
-    Bot->>Bot: Compute midpoint thresholds: (min + max) / 2
-    Bot->>EE: Write CalibData to Address 0 (Magic 0x5446)
-    Bot->>User: 1.5-Second Ready Countdown (3 slow LED flashes)
-    Bot->>Motor: Engage Autonomous PID Navigation Loop
+flowchart LR
+    P1["1 Press on D10\n(Calibrate Sensors)"] --> P2["2 Presses on D10\n(Start Dry Run - 145 Speed)"]
+    P2 --> FIN["Finish Box Reached\n(Saves Shortest Path to EEPROM)"]
+    FIN --> P3["3 Presses on D10\n(Start Short Run - 175 Speed)"]
 ```
 
----
+### Step-by-Step Arena Operation
 
-## 9. Pre-Flight Checklist & Troubleshooting Matrix
-
-### 9.1 Pre-Flight Verification Checklist
-
-- [ ] **Sensor Board VCC:** Ensure the sensor board is rated for 5V logic.
-- [ ] **Common Ground:** Verify $0\,\Omega$ resistance between battery negative, Arduino GND, sensor GND, and TB6612FNG GND.
-- [ ] **Isolated Motor Power:** Verify TB6612FNG **VM** is connected directly to the 6V battery rail, **not** to the Arduino 5V pin.
-- [ ] **Free Wheel Spin:** Keep robot wheels elevated during initial power-on to confirm motor spin directions.
-- [ ] **Calibration Placement:** Place robot centered over the line before power-on so the 360° spin samples both black line and white background.
-
-### 9.2 Troubleshooting Guide
-
-| Symptom | Probable Cause | Corrective Action |
-|---|---|---|
-| **Robot oscillates violently on straight lines** | $K_p$ or $K_d$ gain too high | Decrease $K_p$ (try $0.038$) or increase $K_d$ slightly to damp oscillation. |
-| **Robot turns opposite to line at start** | Motor polarity inverted | Swap motor leads (AO1/AO2 or BO1/BO2) or set `INVERT_LEFT_MOTOR` / `INVERT_RIGHT_MOTOR` in code. |
-| **Misses 90° junctions** | Axle not reaching node before pivot | Increase `INCH_TIME` by $10\text{–}15\text{ ms}$ in `LineFollowerPID.ino`. |
-| **Over-rotates past line during turns** | Braking delay insufficient | Check active counter-torque braking duration (`delay(25)` in `pivot()`). |
-| **False dead-end triggers on track seams** | Seam optical debounce too short | Increase `lostLineStart` timeout from $120\text{ ms}$ to $150\text{ ms}$. |
-| **Calibration values don't save across reboots** | EEPROM write failure or corrupted magic | Verify EEPROM address 0 contains magic key `0x5446`. |
+1. **`1 Press` — Calibrate Sensors (`calibrateSensors`):**
+   - Place the robot over the black line and white floor, then press `D10` **1 time**.
+   - After `0.4s`, the robot spins in place for `4 seconds` (`CALIB_SPIN_SPEED = 125`) while flashing `D13`, saves the calibrated thresholds to `EEPROM` (`0x5446`), and returns to Standby.
+2. **`2 Presses` — Start Dry Run (`MODE_DRY_RUN`, Base Speed `145`):**
+   - Align the robot on the **Start Line** and press `D10` **2 times** (or press **1 time** immediately after calibration).
+   - `D13` blinks **2 times**, waits `0.4s`, loads the `145` Dry-Run profile, and explores the maze.
+   - Upon detecting **3 consecutive T-junctions** at the Finish Box, the robot halts, computes and saves `shortestPath[]` to `EEPROM`, blinks `D13` **6 times**, and enters Standby.
+3. **`3 Presses` — Start Final Short Run (`MODE_SPEED_RUN`, Base Speed `175`):**
+   - Place the robot back on the **Start Line** and press `D10` **3 times** (or press **1 time** right after the Dry Run finishes).
+   - `D13` blinks **3 times**, waits `0.4s`, loads the `175` Final-Run profile, and executes `shortestPath[]` directly to the Finish Box.
+4. **In-Run Emergency Stop / Reset:**
+   - Pressing `D10` at any time while the robot is moving immediately stops the motors and returns to Standby (`waitForButtonCommand`).
+   - Because both calibration and `shortestPath[]` are stored in `EEPROM`, you can power-cycle the robot at any time and press `D10` **3 times** to re-run the saved shortest path directly.
