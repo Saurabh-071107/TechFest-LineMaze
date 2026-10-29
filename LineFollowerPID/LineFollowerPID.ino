@@ -12,11 +12,12 @@ const uint8_t PIN_STBY = 8;
 const uint8_t PIN_BTN = 10;
 const uint8_t PIN_LED = 13;
 
-const uint8_t HISTORY_LEN = 6;
-int errorHistory[HISTORY_LEN] = {0};
+const uint8_t HISTORY_MAX = 6;
+uint8_t activeHistoryLen = 6;
+int errorHistory[HISTORY_MAX] = {0};
 uint8_t errorHistCount = 0;
 uint8_t errorHistIdx = 0;
-uint8_t patternHistory[HISTORY_LEN] = {0};
+uint8_t patternHistory[HISTORY_MAX] = {0};
 
 const uint8_t SENSOR_PINS[7] = {A0, A1, A2, A3, A4, A5, A6};
 const int SENSOR_WEIGHTS[7]  = {-3000, -2000, -1000, 0, 1000, 2000, 3000};
@@ -51,16 +52,36 @@ const int   NOISE_DELTA_MAX   = 30;
 const bool INVERT_LEFT_MOTOR  = false;
 const bool INVERT_RIGHT_MOTOR = false;
 
-const int BASE_SPEED   = 145;
-const int MAX_SPEED    = 210;
-const int TURN_SPEED   = 125;
-const int INCH_TIME    = 220;
+const int CALIB_SPIN_SPEED = 125;
 
-float Kp = 0.048;
-float Ki = 0.00005;
-float Kd = 0.22;
+int baseSpeed   = 145;
+int maxSpeed    = 210;
+int turnSpeed   = 125;
+int inchTime    = 220;
+uint8_t inchBrakeMs = 25;
 
-const unsigned long MIN_JUNCTION_DEBOUNCE = 15;
+float Kp = 0.048f;
+float Ki = 0.00005f;
+float Kd = 0.22f;
+int integralClamp = 1500;
+
+int slewDevMax  = 1800;
+int slewStep    = 1200;
+
+uint8_t pivotUnstickMs  = 100;
+uint8_t pivotClearMs    = 150;
+uint16_t pivotFindMs    = 1200;
+uint8_t pivotBrakeMs    = 30;
+uint8_t pivotSettleMs   = 30;
+uint8_t straightClearMs = 60;
+
+unsigned long minJunctionDebounce = 15;
+unsigned long rearmFallbackMs     = 120;
+unsigned long deadEndTimeoutMs    = 100;
+unsigned long sweep360Time        = 3800;
+uint8_t sweepBrakeMs              = 28;
+uint8_t odomDivisor               = 40;
+
 bool junctionArmed = true;
 uint8_t junctionClearCounter = 0;
 
@@ -71,7 +92,7 @@ unsigned long lastJunctionTime = 0;
 uint8_t tJunctionCount = 0;
 const uint8_t FINISH_JUNCTION_TARGET = 3;
 unsigned long lastTJunctionTime = 0;
-const unsigned long MAX_T_JUNCTION_GAP = 750;
+unsigned long maxTJunctionGap = 750;
 
 enum BotMode : uint8_t { MODE_DRY_RUN = 0, MODE_SPEED_RUN = 1 };
 BotMode botMode = MODE_DRY_RUN;
@@ -170,6 +191,62 @@ void resetTrackingState() {
   junctionClearCounter = 0;
   errorHistCount = 0;
   errorHistIdx = 0;
+}
+
+void applySpeedProfile(BotMode mode) {
+  if (mode == MODE_DRY_RUN) {
+    baseSpeed           = 145;
+    maxSpeed            = 210;
+    turnSpeed           = 125;
+    inchTime            = 220;
+    inchBrakeMs         = 25;
+    Kp                  = 0.048f;
+    Ki                  = 0.00005f;
+    Kd                  = 0.22f;
+    integralClamp       = 1500;
+    activeHistoryLen    = 6;
+    slewDevMax          = 1800;
+    slewStep            = 1200;
+    pivotUnstickMs      = 100;
+    pivotClearMs        = 150;
+    pivotFindMs         = 1200;
+    pivotBrakeMs        = 30;
+    pivotSettleMs       = 30;
+    straightClearMs     = 60;
+    minJunctionDebounce = 15;
+    rearmFallbackMs     = 120;
+    deadEndTimeoutMs    = 100;
+    maxTJunctionGap     = 750;
+    sweep360Time        = 3800;
+    sweepBrakeMs        = 28;
+    odomDivisor         = 40;
+  } else {
+    baseSpeed           = 175;
+    maxSpeed            = 240;
+    turnSpeed           = 145;
+    inchTime            = 180;
+    inchBrakeMs         = 30;
+    Kp                  = 0.058f;
+    Ki                  = 0.00004f;
+    Kd                  = 0.28f;
+    integralClamp       = 1200;
+    activeHistoryLen    = 5;
+    slewDevMax          = 2000;
+    slewStep            = 1400;
+    pivotUnstickMs      = 85;
+    pivotClearMs        = 130;
+    pivotFindMs         = 1000;
+    pivotBrakeMs        = 35;
+    pivotSettleMs       = 25;
+    straightClearMs     = 50;
+    minJunctionDebounce = 12;
+    rearmFallbackMs     = 95;
+    deadEndTimeoutMs    = 80;
+    maxTJunctionGap     = 650;
+    sweep360Time        = 3300;
+    sweepBrakeMs        = 32;
+    odomDivisor         = 33;
+  }
 }
 
 uint8_t turnToDir(uint8_t h, char t) {
@@ -382,7 +459,7 @@ void calibrateSensors() {
     maxVal[i] = 0;
   }
 
-  setMotors(-TURN_SPEED, TURN_SPEED);
+  setMotors(-CALIB_SPIN_SPEED, CALIB_SPIN_SPEED);
   unsigned long tStart = millis();
 
   while (millis() - tStart < 4000) {
@@ -474,6 +551,7 @@ void waitForButtonCommand() {
       delay(400);
       initMazeSolver();
       botMode = MODE_DRY_RUN;
+      applySpeedProfile(botMode);
       tJunctionCount = 0;
       lastTJunctionTime = 0;
       resetTrackingState();
@@ -490,6 +568,7 @@ void waitForButtonCommand() {
       }
       delay(400);
       botMode = MODE_SPEED_RUN;
+      applySpeedProfile(botMode);
       speedRunIdx = 0;
       tJunctionCount = 0;
       lastTJunctionTime = 0;
@@ -518,47 +597,46 @@ void finishAndStop() {
 }
 
 void pivot(bool turnToLeft) {
-  int leftSpeed  = turnToLeft ? -TURN_SPEED : TURN_SPEED;
-  int rightSpeed = turnToLeft ? TURN_SPEED  : -TURN_SPEED;
+  int leftSpeed  = turnToLeft ? -turnSpeed : turnSpeed;
+  int rightSpeed = turnToLeft ? turnSpeed  : -turnSpeed;
 
   setMotors(leftSpeed, rightSpeed);
 
-  delay(100);
+  delay(pivotUnstickMs);
   unsigned long t = millis();
-  while (isSensorOnLine(3) && (millis() - t < 150)) {
+  while (isSensorOnLine(3) && (millis() - t < pivotClearMs)) {
     delay(1);
   }
 
   t = millis();
-  while (!isSensorOnLine(3) && (millis() - t < 1200)) {
+  while (!isSensorOnLine(3) && (millis() - t < pivotFindMs)) {
     delay(1);
   }
 
   setMotors(-leftSpeed / 2, -rightSpeed / 2);
-  delay(30);
+  delay(pivotBrakeMs);
   setMotors(0, 0);
-  delay(30);
+  delay(pivotSettleMs);
 
   resetTrackingState();
 }
 
 void driveStraightPastJunction() {
-  setMotors(BASE_SPEED, BASE_SPEED);
-  delay(60);
+  setMotors(baseSpeed, baseSpeed);
+  delay(straightClearMs);
   resetTrackingState();
 }
 
 void search360AndStop() {
-  int leftSpeed  = (lastError >= 0) ? -TURN_SPEED : TURN_SPEED;
-  int rightSpeed = (lastError >= 0) ? TURN_SPEED  : -TURN_SPEED;
+  int leftSpeed  = (lastError >= 0) ? -turnSpeed : turnSpeed;
+  int rightSpeed = (lastError >= 0) ? turnSpeed  : -turnSpeed;
 
   setMotors(leftSpeed, rightSpeed);
 
   bool lineFound = false;
   unsigned long tStart = millis();
-  const unsigned long SWEEP_360_TIME = 3800;
 
-  while (millis() - tStart < SWEEP_360_TIME) {
+  while (millis() - tStart < sweep360Time) {
     if (isSensorOnLine(3)) {
       delay(3);
       if (isSensorOnLine(3)) {
@@ -573,7 +651,7 @@ void search360AndStop() {
 
   if (lineFound) {
     setMotors(-leftSpeed / 2, -rightSpeed / 2);
-    delay(28);
+    delay(sweepBrakeMs);
     setMotors(0, 0);
     delay(20);
 
@@ -660,17 +738,17 @@ int applyDataProtection(int rawError, uint8_t rawPattern, bool &junctionSupporte
   if (count >= 3) {
     int deviation = rawError - avgError;
 
-    if (deviation > 1800) {
-      protectedError = avgError + 1200;
-    } else if (deviation < -1800) {
-      protectedError = avgError - 1200;
+    if (deviation > slewDevMax) {
+      protectedError = avgError + slewStep;
+    } else if (deviation < -slewDevMax) {
+      protectedError = avgError - slewStep;
     }
   }
 
   errorHistory[errorHistIdx] = protectedError;
   patternHistory[errorHistIdx] = rawPattern;
-  errorHistIdx = (errorHistIdx + 1) % HISTORY_LEN;
-  if (errorHistCount < HISTORY_LEN) errorHistCount++;
+  errorHistIdx = (errorHistIdx + 1) % activeHistoryLen;
+  if (errorHistCount < activeHistoryLen) errorHistCount++;
 
   sum = 0;
   for (uint8_t i = 0; i < errorHistCount; i++) {
@@ -779,6 +857,7 @@ void setup() {
   }
 
   loadShortestPathFromEEPROM();
+  applySpeedProfile(MODE_DRY_RUN);
 
   nextStage = 1;
   waitForButtonCommand();
@@ -804,14 +883,14 @@ void loop() {
       lostLineStart = millis();
     }
 
-    if (millis() - lostLineStart > 100) {
+    if (millis() - lostLineStart > deadEndTimeoutMs) {
       search360AndStop();
       recordDeadEnd();
       lostLineStart = 0;
       return;
     }
 
-    setMotors(BASE_SPEED / 2, BASE_SPEED / 2);
+    setMotors(baseSpeed / 2, baseSpeed / 2);
     return;
   }
   lostLineStart = 0;
@@ -823,8 +902,8 @@ void loop() {
     bool outerClear = !isSensorOnLine(0) && !isSensorOnLine(1) &&
                       !isSensorOnLine(5) && !isSensorOnLine(6);
     unsigned long timeSinceJunction = millis() - lastJunctionTime;
-    if ((outerClear && timeSinceJunction > MIN_JUNCTION_DEBOUNCE) ||
-        (timeSinceJunction > 120 && isSensorOnLine(3))) {
+    if ((outerClear && timeSinceJunction > minJunctionDebounce) ||
+        (timeSinceJunction > rearmFallbackMs && isSensorOnLine(3))) {
       junctionClearCounter++;
       if (junctionClearCounter >= 1) {
         junctionArmed = true;
@@ -846,15 +925,15 @@ void loop() {
     bool branchRight = hasRight || hasCross || confR || confCross || (isSensorOnLine(6) && isSensorOnLine(5));
     bool branchLeft  = hasLeft  || hasCross || confL || confCross || (isSensorOnLine(0) && isSensorOnLine(1));
 
-    setMotors(BASE_SPEED, BASE_SPEED);
+    setMotors(baseSpeed, baseSpeed);
     unsigned long tInch = millis();
-    while (millis() - tInch < INCH_TIME) {
+    while (millis() - tInch < (unsigned long)inchTime) {
       if (isSensorOnLine(6) && isSensorOnLine(5)) branchRight = true;
       if (isSensorOnLine(0) && isSensorOnLine(1)) branchLeft  = true;
     }
 
-    setMotors(-BASE_SPEED / 2, -BASE_SPEED / 2);
-    delay(25);
+    setMotors(-baseSpeed / 2, -baseSpeed / 2);
+    delay(inchBrakeMs);
     setMotors(0, 0);
 
     blinkJunction();
@@ -862,7 +941,7 @@ void loop() {
     bool isTJunction = (branchLeft && branchRight) || hasCross || confCross;
     if (isTJunction) {
       unsigned long timeSinceLastT = millis() - lastTJunctionTime;
-      if (tJunctionCount == 0 || timeSinceLastT > MAX_T_JUNCTION_GAP) {
+      if (tJunctionCount == 0 || timeSinceLastT > maxTJunctionGap) {
         tJunctionCount = 1;
         preFinishStackLen = stackLen;
         preFinishNode = currentNode;
@@ -918,7 +997,7 @@ void loop() {
     if (straightAhead) exitsMask |= (1 << inHead);
     if (branchLeft)    exitsMask |= (1 << leftDir);
 
-    uint8_t segCost = (uint8_t)constrain((millis() - segmentStartTime) / 40UL, 1UL, 250UL);
+    uint8_t segCost = (uint8_t)constrain((millis() - segmentStartTime) / (unsigned long)odomDivisor, 1UL, 250UL);
     uint8_t arrivedNode = 0xFF;
 
     if (lastTurnWasBack && currentNode < nodeCount) {
@@ -991,7 +1070,7 @@ void loop() {
     return;
   }
 
-  if (tJunctionCount > 0 && (millis() - lastTJunctionTime > MAX_T_JUNCTION_GAP)) {
+  if (tJunctionCount > 0 && (millis() - lastTJunctionTime > maxTJunctionGap)) {
     tJunctionCount = 0;
   }
 
@@ -1000,15 +1079,15 @@ void loop() {
   }
 
   if (abs(error) > 40) {
-    integral = constrain(integral + error, -1500, 1500);
+    integral = constrain(integral + error, -integralClamp, integralClamp);
   } else {
     integral = 0;
   }
   float derivative = error - lastError;
   int correction = (int)(Kp * error + Ki * integral + Kd * derivative);
 
-  int leftSpeed  = constrain(BASE_SPEED + correction, -MAX_SPEED, MAX_SPEED);
-  int rightSpeed = constrain(BASE_SPEED - correction, -MAX_SPEED, MAX_SPEED);
+  int leftSpeed  = constrain(baseSpeed + correction, -maxSpeed, maxSpeed);
+  int rightSpeed = constrain(baseSpeed - correction, -maxSpeed, maxSpeed);
 
   setMotors(leftSpeed, rightSpeed);
   lastError = error;
