@@ -67,6 +67,11 @@ int lastError = 0;
 float integral = 0;
 unsigned long lastJunctionTime = 0;
 
+uint8_t consecutiveJunctionCount = 0;
+const uint8_t FINISH_JUNCTION_TARGET = 3;
+const unsigned long BACK_TO_BACK_WINDOW = 650;
+uint16_t sustainedLineCycles = 0;
+
 bool isOnLine(int raw, uint8_t idx) {
   return BLACK_LINE ? (raw > sensorThreshold[idx]) : (raw < sensorThreshold[idx]);
 }
@@ -105,6 +110,16 @@ void blinkJunction() {
     delay(25);
     digitalWrite(PIN_LED, LOW);
     delay(20);
+  }
+}
+
+void finishAndStop() {
+  setMotors(0, 0);
+  while (true) {
+    digitalWrite(PIN_LED, HIGH);
+    delay(150);
+    digitalWrite(PIN_LED, LOW);
+    delay(150);
   }
 }
 
@@ -428,6 +443,8 @@ void setup() {
 
   lastJunctionTime = millis();
   junctionArmed = true;
+  consecutiveJunctionCount = 0;
+  sustainedLineCycles = 0;
   errorHistCount = 0;
   errorHistIdx = 0;
 }
@@ -478,6 +495,21 @@ void loop() {
   }
 
   if ((hasLeft || hasRight || hasCross) && junctionArmed && junctionSupported) {
+    unsigned long timeSinceLast = millis() - lastJunctionTime;
+    if (timeSinceLast < BACK_TO_BACK_WINDOW) {
+      consecutiveJunctionCount++;
+    } else {
+      consecutiveJunctionCount = 1;
+    }
+    sustainedLineCycles = 0;
+
+    if (consecutiveJunctionCount >= FINISH_JUNCTION_TARGET) {
+      setMotors(-BASE_SPEED / 2, -BASE_SPEED / 2);
+      delay(30);
+      finishAndStop();
+      return;
+    }
+
     bool confL = false, confR = false, confCross = false;
     readSensors(confL, confR, confCross);
 
@@ -519,6 +551,11 @@ void loop() {
       search360AndStop();
     }
     return;
+  }
+
+  sustainedLineCycles++;
+  if (sustainedLineCycles > 30) {
+    consecutiveJunctionCount = 0;
   }
 
   if (calibrationAllowed(error, pattern, hasLeft, hasRight, hasCross, allWhite)) {
