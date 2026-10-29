@@ -53,7 +53,7 @@ const bool INVERT_RIGHT_MOTOR = false;
 const int BASE_SPEED   = 145;
 const int MAX_SPEED    = 210;
 const int TURN_SPEED   = 125;
-const int INCH_TIME    = 200;
+const int INCH_TIME    = 220;
 
 float Kp = 0.048;
 float Ki = 0.00005;
@@ -67,10 +67,10 @@ int lastError = 0;
 float integral = 0;
 unsigned long lastJunctionTime = 0;
 
-uint8_t consecutiveJunctionCount = 0;
+uint8_t tJunctionCount = 0;
 const uint8_t FINISH_JUNCTION_TARGET = 3;
-const unsigned long BACK_TO_BACK_WINDOW = 650;
-uint16_t sustainedLineCycles = 0;
+unsigned long lastTJunctionTime = 0;
+const unsigned long MAX_T_JUNCTION_GAP = 750;
 
 bool isOnLine(int raw, uint8_t idx) {
   return BLACK_LINE ? (raw > sensorThreshold[idx]) : (raw < sensorThreshold[idx]);
@@ -129,21 +129,21 @@ void pivot(bool turnToLeft) {
 
   setMotors(leftSpeed, rightSpeed);
 
-  delay(40);
+  delay(100);
   unsigned long t = millis();
   while (isSensorOnLine(3) && (millis() - t < 150)) {
     delay(1);
   }
 
   t = millis();
-  while (!isSensorOnLine(3) && (millis() - t < 900)) {
+  while (!isSensorOnLine(3) && (millis() - t < 1200)) {
     delay(1);
   }
 
   setMotors(-leftSpeed / 2, -rightSpeed / 2);
-  delay(28);
+  delay(30);
   setMotors(0, 0);
-  delay(20);
+  delay(30);
 
   integral = 0;
   lastError = 0;
@@ -442,9 +442,9 @@ void setup() {
   }
 
   lastJunctionTime = millis();
+  lastTJunctionTime = 0;
   junctionArmed = true;
-  consecutiveJunctionCount = 0;
-  sustainedLineCycles = 0;
+  tJunctionCount = 0;
   errorHistCount = 0;
   errorHistIdx = 0;
 }
@@ -495,21 +495,6 @@ void loop() {
   }
 
   if ((hasLeft || hasRight || hasCross) && junctionArmed && junctionSupported) {
-    unsigned long timeSinceLast = millis() - lastJunctionTime;
-    if (timeSinceLast < BACK_TO_BACK_WINDOW) {
-      consecutiveJunctionCount++;
-    } else {
-      consecutiveJunctionCount = 1;
-    }
-    sustainedLineCycles = 0;
-
-    if (consecutiveJunctionCount >= FINISH_JUNCTION_TARGET) {
-      setMotors(-BASE_SPEED / 2, -BASE_SPEED / 2);
-      delay(30);
-      finishAndStop();
-      return;
-    }
-
     bool confL = false, confR = false, confCross = false;
     readSensors(confL, confR, confCross);
 
@@ -533,6 +518,24 @@ void loop() {
 
     blinkJunction();
 
+    bool isTJunction = (branchLeft && branchRight) || hasCross || confCross;
+    if (isTJunction) {
+      unsigned long timeSinceLastT = millis() - lastTJunctionTime;
+      if (tJunctionCount > 0 && timeSinceLastT > MAX_T_JUNCTION_GAP) {
+        tJunctionCount = 1;
+      } else {
+        tJunctionCount++;
+      }
+      lastTJunctionTime = millis();
+
+      if (tJunctionCount >= FINISH_JUNCTION_TARGET) {
+        finishAndStop();
+        return;
+      }
+    } else {
+      tJunctionCount = 0;
+    }
+
     bool straightAhead = isSensorOnLine(2) || isSensorOnLine(3) || isSensorOnLine(4);
 
     if (branchRight) {
@@ -553,9 +556,8 @@ void loop() {
     return;
   }
 
-  sustainedLineCycles++;
-  if (sustainedLineCycles > 30) {
-    consecutiveJunctionCount = 0;
+  if (tJunctionCount > 0 && (millis() - lastTJunctionTime > MAX_T_JUNCTION_GAP)) {
+    tJunctionCount = 0;
   }
 
   if (calibrationAllowed(error, pattern, hasLeft, hasRight, hasCross, allWhite)) {
