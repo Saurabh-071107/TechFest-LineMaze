@@ -9,6 +9,7 @@ const uint8_t PIN_BIN1 = 7;
 const uint8_t PIN_BIN2 = 9;
 const uint8_t PIN_STBY = 8;
 
+const uint8_t PIN_BTN = 10;
 const uint8_t PIN_LED = 13;
 
 const uint8_t HISTORY_LEN = 6;
@@ -72,6 +73,54 @@ const uint8_t FINISH_JUNCTION_TARGET = 3;
 unsigned long lastTJunctionTime = 0;
 const unsigned long MAX_T_JUNCTION_GAP = 750;
 
+enum BotMode : uint8_t { MODE_DRY_RUN = 0, MODE_SPEED_RUN = 1 };
+BotMode botMode = MODE_DRY_RUN;
+uint8_t nextStage = 1;
+
+const uint8_t MAX_NODES = 28;
+const uint8_t MAX_PATH_LEN = 64;
+const int16_t SNAP_RADIUS = 12;
+
+const int8_t DIR_DX[4] = {0, 1, 0, -1};
+const int8_t DIR_DY[4] = {1, 0, -1, 0};
+
+struct MazeNode {
+  int16_t x, y;
+  uint8_t exitsMask;
+  uint8_t visitedMask;
+  uint8_t neighbor[4];
+  uint8_t edgeCost[4];
+};
+
+MazeNode nodes[MAX_NODES];
+uint8_t nodeCount = 0;
+uint8_t currentNode = 0;
+uint8_t currentHeading = 0;
+uint8_t lastExitDir = 0;
+int16_t curX = 0, curY = 0;
+unsigned long segmentStartTime = 0;
+uint8_t consecutiveRightTurns = 0;
+bool lastTurnWasBack = false;
+
+char shortestPath[MAX_PATH_LEN];
+uint8_t shortestPathLen = 0;
+uint8_t speedRunIdx = 0;
+
+const uint16_t PATH_MAGIC = 0x5046;
+const int PATH_EEPROM_ADDR = sizeof(CalibData);
+struct StoredPath {
+  uint16_t magic;
+  uint8_t len;
+  char turns[MAX_PATH_LEN];
+};
+
+uint8_t stackNode[MAX_PATH_LEN];
+uint8_t stackInHeading[MAX_PATH_LEN];
+char    stackTurn[MAX_PATH_LEN];
+uint8_t stackLen = 0;
+uint8_t preFinishStackLen = 0;
+uint8_t preFinishNode = 0;
+
 bool isOnLine(int raw, uint8_t idx) {
   return BLACK_LINE ? (raw > sensorThreshold[idx]) : (raw < sensorThreshold[idx]);
 }
@@ -113,14 +162,359 @@ void blinkJunction() {
   }
 }
 
+void resetTrackingState() {
+  integral = 0;
+  lastError = 0;
+  lastJunctionTime = millis();
+  junctionArmed = false;
+  junctionClearCounter = 0;
+  errorHistCount = 0;
+  errorHistIdx = 0;
+}
+
+uint8_t turnToDir(uint8_t h, char t) {
+  if (t == 'R') return (h + 1) & 3;
+  if (t == 'L') return (h + 3) & 3;
+  if (t == 'B') return (h + 2) & 3;
+  return h;
+}
+
+char dirsToTurn(uint8_t inDir, uint8_t outDir) {
+  uint8_t d = (outDir - inDir + 4) & 3;
+  return (d == 0) ? 'S' : (d == 1) ? 'R' : (d == 3) ? 'L' : 'B';
+}
+
+uint8_t allocNode(int16_t x, int16_t y, uint8_t exitsMask) {
+  if (nodeCount >= MAX_NODES) return 0xFF;
+  uint8_t id = nodeCount++;
+  nodes[id].x = x;
+  nodes[id].y = y;
+  nodes[id].exitsMask = exitsMask;
+  nodes[id].visitedMask = 0;
+  for (uint8_t d = 0; d < 4; d++) {
+    nodes[id].neighbor[d] = 0xFF;
+    nodes[id].edgeCost[d] = 0xFF;
+  }
+  return id;
+}
+
+void initMazeSolver() {
+  nodeCount = 0;
+  curX = 0;
+  curY = 0;
+  currentHeading = 0;
+  lastExitDir = 0;
+  currentNode = allocNode(0, 0, (1 << 0));
+  nodes[0].visitedMask = (1 << 0);
+  stackLen = 0;
+  preFinishStackLen = 0;
+  preFinishNode = 0;
+  shortestPathLen = 0;
+  speedRunIdx = 0;
+  consecutiveRightTurns = 0;
+  lastTurnWasBack = false;
+  botMode = MODE_DRY_RUN;
+  segmentStartTime = millis();
+}
+
+uint8_t findOrCreateNode(int16_t x, int16_t y, uint8_t exitsMask) {
+  for (uint8_t i = 1; i < nodeCount; i++) {
+    if (abs(x - nodes[i].x) <= SNAP_RADIUS && abs(y - nodes[i].y) <= SNAP_RADIUS) {
+      if ((nodes[i].exitsMask & exitsMask) != 0) {
+        curX = nodes[i].x;
+        curY = nodes[i].y;
+        nodes[i].exitsMask |= exitsMask;
+        return i;
+      }
+    }
+  }
+  return allocNode(x, y, exitsMask);
+}
+
+void collapseBStack() {
+  while (stackLen >= 3 && stackTurn[stackLen - 2] == 'B') {
+    uint8_t origIn = stackInHeading[stackLen - 3];
+    uint8_t curOut = turnToDir(stackInHeading[stackLen - 1], stackTurn[stackLen - 1]);
+    char merged = dirsToTurn(origIn, curOut);
+    stackTurn[stackLen - 3] = merged;
+    if (merged == 'B') stackNode[stackLen - 3] = 0xFF;
+    stackLen -= 2;
+  }
+}
+
+void recordAndReduceTurn(uint8_t nodeId, uint8_t inHead, char turn, uint8_t outDir) {
+  if (stackLen < MAX_PATH_LEN) {
+    stackNode[stackLen] = nodeId;
+    stackInHeading[stackLen] = inHead;
+    stackTurn[stackLen] = turn;
+    stackLen++;
+  }
+  collapseBStack();
+  if (nodeId != 0xFF && stackLen >= 2 && stackTurn[stackLen - 1] != 'B') {
+    for (uint8_t m = 0; m + 1 < stackLen; m++) {
+      if (stackNode[m] == nodeId) {
+        char merged = dirsToTurn(stackInHeading[m], outDir);
+        stackTurn[m] = merged;
+        if (merged == 'B') stackNode[m] = 0xFF;
+        stackLen = m + 1;
+        collapseBStack();
+        break;
+      }
+    }
+  }
+}
+
+void recordDeadEnd() {
+  if (botMode != MODE_DRY_RUN) return;
+  if (stackLen == 0 || stackTurn[stackLen - 1] != 'B') {
+    if (stackLen < MAX_PATH_LEN) {
+      stackNode[stackLen] = 0xFF;
+      stackInHeading[stackLen] = currentHeading;
+      stackTurn[stackLen] = 'B';
+      stackLen++;
+    }
+  }
+  currentHeading = (currentHeading + 2) & 3;
+  lastTurnWasBack = true;
+  consecutiveRightTurns = 0;
+  segmentStartTime = millis();
+}
+
+void saveShortestPathToEEPROM() {
+  StoredPath sp;
+  sp.magic = PATH_MAGIC;
+  sp.len = shortestPathLen;
+  for (uint8_t i = 0; i < MAX_PATH_LEN; i++) {
+    sp.turns[i] = (i < shortestPathLen) ? shortestPath[i] : 0;
+  }
+  EEPROM.put(PATH_EEPROM_ADDR, sp);
+}
+
+void loadShortestPathFromEEPROM() {
+  StoredPath sp;
+  EEPROM.get(PATH_EEPROM_ADDR, sp);
+  if (sp.magic == PATH_MAGIC && sp.len <= MAX_PATH_LEN) {
+    shortestPathLen = sp.len;
+    for (uint8_t i = 0; i < shortestPathLen; i++) {
+      shortestPath[i] = sp.turns[i];
+    }
+  }
+}
+
+void computeShortestPath() {
+  uint8_t validStackLen = preFinishStackLen;
+  while (validStackLen > 0 && stackTurn[validStackLen - 1] == 'B') {
+    validStackLen--;
+  }
+  shortestPathLen = 0;
+  for (uint8_t i = 0; i < validStackLen && shortestPathLen < MAX_PATH_LEN; i++) {
+    if (stackTurn[i] != 'B') {
+      shortestPath[shortestPathLen++] = stackTurn[i];
+    }
+  }
+
+  if (preFinishNode > 0 && preFinishNode < nodeCount) {
+    uint16_t dist[MAX_NODES];
+    uint8_t prevNode[MAX_NODES];
+    uint8_t prevDir[MAX_NODES];
+    bool used[MAX_NODES];
+
+    for (uint8_t i = 0; i < nodeCount; i++) {
+      dist[i] = 0xFFFF;
+      prevNode[i] = 0xFF;
+      prevDir[i] = 0;
+      used[i] = false;
+    }
+    dist[0] = 0;
+
+    for (uint8_t step = 0; step < nodeCount; step++) {
+      uint8_t u = 0xFF;
+      uint16_t best = 0xFFFF;
+      for (uint8_t i = 0; i < nodeCount; i++) {
+        if (!used[i] && dist[i] < best) {
+          best = dist[i];
+          u = i;
+        }
+      }
+      if (u == 0xFF || u == preFinishNode) break;
+      used[u] = true;
+
+      for (uint8_t d = 0; d < 4; d++) {
+        uint8_t v = nodes[u].neighbor[d];
+        if (v < nodeCount && !used[v]) {
+          uint16_t nd = dist[u] + nodes[u].edgeCost[d];
+          if (nd < dist[v]) {
+            dist[v] = nd;
+            prevNode[v] = u;
+            prevDir[v] = d;
+          }
+        }
+      }
+    }
+
+    if (dist[preFinishNode] != 0xFFFF) {
+      uint8_t revDirs[MAX_NODES];
+      uint8_t count = 0;
+      uint8_t cur = preFinishNode;
+      while (cur != 0 && cur < nodeCount && count < MAX_NODES) {
+        revDirs[count] = prevDir[cur];
+        cur = prevNode[cur];
+        count++;
+      }
+      if (cur == 0 && count >= 2 && (count - 1 < shortestPathLen)) {
+        shortestPathLen = 0;
+        uint8_t inDir = revDirs[count - 1];
+        for (int8_t k = (int8_t)count - 2; k >= 0; k--) {
+          uint8_t outDir = revDirs[k];
+          shortestPath[shortestPathLen++] = dirsToTurn(inDir, outDir);
+          inDir = outDir;
+        }
+      }
+    }
+  }
+  saveShortestPathToEEPROM();
+}
+
+void calibrateSensors() {
+  int minVal[7], maxVal[7];
+  for (int i = 0; i < 7; i++) {
+    minVal[i] = 1023;
+    maxVal[i] = 0;
+  }
+
+  setMotors(-TURN_SPEED, TURN_SPEED);
+  unsigned long tStart = millis();
+
+  while (millis() - tStart < 4000) {
+    for (int i = 0; i < 7; i++) {
+      int v = analogRead(SENSOR_PINS[i]);
+      if (v < minVal[i]) minVal[i] = v;
+      if (v > maxVal[i]) maxVal[i] = v;
+    }
+
+    digitalWrite(PIN_LED, (millis() / 70) % 2);
+    delay(2);
+  }
+
+  setMotors(0, 0);
+
+  calib.magic = EEPROM_MAGIC;
+  for (int i = 0; i < 7; i++) {
+    calib.minVal[i] = minVal[i];
+    calib.maxVal[i] = maxVal[i];
+    calib.threshold[i] = (minVal[i] + maxVal[i]) / 2;
+
+    initialMin[i] = minVal[i];
+    initialMax[i] = maxVal[i];
+    initialThreshold[i] = calib.threshold[i];
+
+    currentMin[i] = (float)minVal[i];
+    currentMax[i] = (float)maxVal[i];
+    sensorThreshold[i] = calib.threshold[i];
+
+    for (int s = 0; s < 3; s++) {
+      rawHistory[i][s] = calib.threshold[i];
+    }
+  }
+  EEPROM.put(EEPROM_ADDR, calib);
+
+  digitalWrite(PIN_LED, LOW);
+  delay(300);
+}
+
+uint8_t readButtonPresses() {
+  while (digitalRead(PIN_BTN) == HIGH) {
+    digitalWrite(PIN_LED, ((millis() % 800) < 60) ? HIGH : LOW);
+    delay(10);
+  }
+  uint8_t presses = 0;
+  unsigned long lastRelease = millis();
+  while (true) {
+    if (digitalRead(PIN_BTN) == LOW) {
+      digitalWrite(PIN_LED, HIGH);
+      delay(30);
+      while (digitalRead(PIN_BTN) == LOW) {
+        delay(5);
+      }
+      digitalWrite(PIN_LED, LOW);
+      delay(30);
+      presses++;
+      lastRelease = millis();
+    }
+    if (presses > 0 && (millis() - lastRelease >= 550)) {
+      break;
+    }
+    delay(5);
+  }
+  return presses;
+}
+
+void waitForButtonCommand() {
+  setMotors(0, 0);
+  while (digitalRead(PIN_BTN) == LOW) {
+    delay(10);
+  }
+  delay(30);
+
+  while (true) {
+    uint8_t p = readButtonPresses();
+    uint8_t cmd = (p >= 2) ? p : nextStage;
+
+    if (cmd == 1) {
+      delay(400);
+      calibrateSensors();
+      nextStage = 2;
+    } else if (cmd == 2) {
+      for (uint8_t i = 0; i < 2; i++) {
+        digitalWrite(PIN_LED, HIGH);
+        delay(150);
+        digitalWrite(PIN_LED, LOW);
+        delay(150);
+      }
+      delay(400);
+      initMazeSolver();
+      botMode = MODE_DRY_RUN;
+      tJunctionCount = 0;
+      lastTJunctionTime = 0;
+      resetTrackingState();
+      junctionArmed = true;
+      segmentStartTime = millis();
+      nextStage = 3;
+      return;
+    } else {
+      for (uint8_t i = 0; i < 3; i++) {
+        digitalWrite(PIN_LED, HIGH);
+        delay(120);
+        digitalWrite(PIN_LED, LOW);
+        delay(120);
+      }
+      delay(400);
+      botMode = MODE_SPEED_RUN;
+      speedRunIdx = 0;
+      tJunctionCount = 0;
+      lastTJunctionTime = 0;
+      resetTrackingState();
+      junctionArmed = true;
+      segmentStartTime = millis();
+      nextStage = 3;
+      return;
+    }
+  }
+}
+
 void finishAndStop() {
   setMotors(0, 0);
-  while (true) {
-    digitalWrite(PIN_LED, HIGH);
-    delay(150);
-    digitalWrite(PIN_LED, LOW);
-    delay(150);
+  if (botMode == MODE_DRY_RUN) {
+    computeShortestPath();
   }
+  for (uint8_t i = 0; i < 6; i++) {
+    digitalWrite(PIN_LED, HIGH);
+    delay(100);
+    digitalWrite(PIN_LED, LOW);
+    delay(100);
+  }
+  nextStage = 3;
+  waitForButtonCommand();
 }
 
 void pivot(bool turnToLeft) {
@@ -145,17 +539,16 @@ void pivot(bool turnToLeft) {
   setMotors(0, 0);
   delay(30);
 
-  integral = 0;
-  lastError = 0;
-  lastJunctionTime = millis();
-  junctionArmed = false;
-  junctionClearCounter = 0;
-  errorHistCount = 0;
-  errorHistIdx = 0;
+  resetTrackingState();
+}
+
+void driveStraightPastJunction() {
+  setMotors(BASE_SPEED, BASE_SPEED);
+  delay(60);
+  resetTrackingState();
 }
 
 void search360AndStop() {
-
   int leftSpeed  = (lastError >= 0) ? -TURN_SPEED : TURN_SPEED;
   int rightSpeed = (lastError >= 0) ? TURN_SPEED  : -TURN_SPEED;
 
@@ -179,29 +572,28 @@ void search360AndStop() {
   }
 
   if (lineFound) {
-
     setMotors(-leftSpeed / 2, -rightSpeed / 2);
     delay(28);
     setMotors(0, 0);
     delay(20);
 
     digitalWrite(PIN_LED, LOW);
-    integral = 0;
-    lastError = 0;
-    lastJunctionTime = millis();
-    junctionArmed = false;
-    junctionClearCounter = 0;
-    errorHistCount = 0;
-    errorHistIdx = 0;
+    resetTrackingState();
   } else {
-
     setMotors(0, 0);
-    while (true) {
-      digitalWrite(PIN_LED, HIGH);
-      delay(400);
-      digitalWrite(PIN_LED, LOW);
-      delay(400);
-    }
+    waitForButtonCommand();
+  }
+}
+
+void executeTurn(char turn) {
+  if (turn == 'R') {
+    pivot(false);
+  } else if (turn == 'S') {
+    driveStraightPastJunction();
+  } else if (turn == 'L') {
+    pivot(true);
+  } else {
+    search360AndStop();
   }
 }
 
@@ -257,7 +649,6 @@ int readSensors(bool &hasLeft, bool &hasRight, bool &hasCross, bool *allWhite = 
 }
 
 int applyDataProtection(int rawError, uint8_t rawPattern, bool &junctionSupported) {
-
   int sum = 0;
   uint8_t count = errorHistCount;
   for (uint8_t i = 0; i < count; i++) {
@@ -302,7 +693,6 @@ int applyDataProtection(int rawError, uint8_t rawPattern, bool &junctionSupporte
 }
 
 bool calibrationAllowed(int error, uint8_t pattern, bool hasLeft, bool hasRight, bool hasCross, bool allWhite) {
-
   if (allWhite || pattern == 0) return false;
 
   if (hasLeft || hasRight || hasCross) return false;
@@ -347,53 +737,6 @@ void updateOnlineCalibration() {
   }
 }
 
-void calibrateSensors() {
-  int minVal[7], maxVal[7];
-  for (int i = 0; i < 7; i++) {
-    minVal[i] = 1023;
-    maxVal[i] = 0;
-  }
-
-  setMotors(-TURN_SPEED, TURN_SPEED);
-  unsigned long tStart = millis();
-
-  while (millis() - tStart < 4000) {
-    for (int i = 0; i < 7; i++) {
-      int v = analogRead(SENSOR_PINS[i]);
-      if (v < minVal[i]) minVal[i] = v;
-      if (v > maxVal[i]) maxVal[i] = v;
-    }
-
-    digitalWrite(PIN_LED, (millis() / 70) % 2);
-    delay(2);
-  }
-
-  setMotors(0, 0);
-
-  calib.magic = EEPROM_MAGIC;
-  for (int i = 0; i < 7; i++) {
-    calib.minVal[i] = minVal[i];
-    calib.maxVal[i] = maxVal[i];
-    calib.threshold[i] = (minVal[i] + maxVal[i]) / 2;
-
-    initialMin[i] = minVal[i];
-    initialMax[i] = maxVal[i];
-    initialThreshold[i] = calib.threshold[i];
-
-    currentMin[i] = (float)minVal[i];
-    currentMax[i] = (float)maxVal[i];
-    sensorThreshold[i] = calib.threshold[i];
-
-    for (int s = 0; s < 3; s++) {
-      rawHistory[i][s] = calib.threshold[i];
-    }
-  }
-  EEPROM.put(EEPROM_ADDR, calib);
-
-  digitalWrite(PIN_LED, LOW);
-  delay(300);
-}
-
 void setup() {
   pinMode(PIN_PWMA, OUTPUT);
   pinMode(PIN_AIN1, OUTPUT);
@@ -403,6 +746,7 @@ void setup() {
   pinMode(PIN_BIN2, OUTPUT);
   pinMode(PIN_STBY, OUTPUT);
 
+  pinMode(PIN_BTN, INPUT_PULLUP);
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
 
@@ -423,33 +767,29 @@ void setup() {
         rawHistory[i][s] = calib.threshold[i];
       }
     }
+  } else {
+    for (int i = 0; i < 7; i++) {
+      sensorThreshold[i] = 512;
+      initialMin[i] = 0;
+      initialMax[i] = 1023;
+      initialThreshold[i] = 512;
+      currentMin[i] = 0.0f;
+      currentMax[i] = 1023.0f;
+    }
   }
 
-  for (int i = 0; i < 8; i++) {
-    digitalWrite(PIN_LED, HIGH);
-    delay(125);
-    digitalWrite(PIN_LED, LOW);
-    delay(125);
-  }
+  loadShortestPathFromEEPROM();
 
-  calibrateSensors();
-
-  for (int i = 0; i < 3; i++) {
-    digitalWrite(PIN_LED, HIGH);
-    delay(250);
-    digitalWrite(PIN_LED, LOW);
-    delay(250);
-  }
-
-  lastJunctionTime = millis();
-  lastTJunctionTime = 0;
-  junctionArmed = true;
-  tJunctionCount = 0;
-  errorHistCount = 0;
-  errorHistIdx = 0;
+  nextStage = 1;
+  waitForButtonCommand();
 }
 
 void loop() {
+  if (digitalRead(PIN_BTN) == LOW) {
+    waitForButtonCommand();
+    return;
+  }
+
   bool hasLeft  = false;
   bool hasRight = false;
   bool hasCross = false;
@@ -466,6 +806,7 @@ void loop() {
 
     if (millis() - lostLineStart > 100) {
       search360AndStop();
+      recordDeadEnd();
       lostLineStart = 0;
       return;
     }
@@ -521,8 +862,10 @@ void loop() {
     bool isTJunction = (branchLeft && branchRight) || hasCross || confCross;
     if (isTJunction) {
       unsigned long timeSinceLastT = millis() - lastTJunctionTime;
-      if (tJunctionCount > 0 && timeSinceLastT > MAX_T_JUNCTION_GAP) {
+      if (tJunctionCount == 0 || timeSinceLastT > MAX_T_JUNCTION_GAP) {
         tJunctionCount = 1;
+        preFinishStackLen = stackLen;
+        preFinishNode = currentNode;
       } else {
         tJunctionCount++;
       }
@@ -538,21 +881,113 @@ void loop() {
 
     bool straightAhead = isSensorOnLine(2) || isSensorOnLine(3) || isSensorOnLine(4);
 
-    if (branchRight) {
-      pivot(false);
-    } else if (straightAhead) {
-      setMotors(BASE_SPEED, BASE_SPEED);
-      delay(60);
-      integral = 0;
-      lastError = 0;
-      lastJunctionTime = millis();
-      junctionArmed = false;
-      junctionClearCounter = 0;
-    } else if (branchLeft) {
-      pivot(true);
-    } else {
-      search360AndStop();
+    if (botMode == MODE_SPEED_RUN) {
+      if (speedRunIdx < shortestPathLen) {
+        char cmd = shortestPath[speedRunIdx++];
+        if (cmd == 'R' && !branchRight && !straightAhead && branchLeft) cmd = 'L';
+        else if (cmd == 'L' && !branchLeft && !straightAhead && branchRight) cmd = 'R';
+        else if (cmd == 'S' && !straightAhead) cmd = branchRight ? 'R' : (branchLeft ? 'L' : 'B');
+        executeTurn(cmd);
+      } else if (isTJunction && straightAhead) {
+        driveStraightPastJunction();
+      } else if (branchRight) {
+        pivot(false);
+      } else if (straightAhead) {
+        driveStraightPastJunction();
+      } else if (branchLeft) {
+        pivot(true);
+      } else {
+        search360AndStop();
+      }
+      return;
     }
+
+    if (!branchRight && !straightAhead && !branchLeft) {
+      search360AndStop();
+      recordDeadEnd();
+      return;
+    }
+
+    uint8_t inHead   = currentHeading;
+    uint8_t entryDir = (inHead + 2) & 3;
+    uint8_t rightDir = (inHead + 1) & 3;
+    uint8_t leftDir  = (inHead + 3) & 3;
+
+    uint8_t exitsMask = (1 << entryDir);
+    if (branchRight)   exitsMask |= (1 << rightDir);
+    if (straightAhead) exitsMask |= (1 << inHead);
+    if (branchLeft)    exitsMask |= (1 << leftDir);
+
+    uint8_t segCost = (uint8_t)constrain((millis() - segmentStartTime) / 40UL, 1UL, 250UL);
+    uint8_t arrivedNode = 0xFF;
+
+    if (lastTurnWasBack && currentNode < nodeCount) {
+      arrivedNode = currentNode;
+      curX = nodes[arrivedNode].x;
+      curY = nodes[arrivedNode].y;
+      nodes[arrivedNode].exitsMask |= exitsMask;
+    } else {
+      curX += (int16_t)DIR_DX[inHead] * segCost;
+      curY += (int16_t)DIR_DY[inHead] * segCost;
+      arrivedNode = findOrCreateNode(curX, curY, exitsMask);
+      if (currentNode < nodeCount && arrivedNode < nodeCount && arrivedNode != currentNode) {
+        if (segCost < nodes[currentNode].edgeCost[lastExitDir]) {
+          nodes[currentNode].neighbor[lastExitDir] = arrivedNode;
+          nodes[currentNode].edgeCost[lastExitDir] = segCost;
+        }
+        if (segCost < nodes[arrivedNode].edgeCost[entryDir]) {
+          nodes[arrivedNode].neighbor[entryDir] = currentNode;
+          nodes[arrivedNode].edgeCost[entryDir] = segCost;
+        }
+      }
+    }
+
+    if (arrivedNode < nodeCount) {
+      nodes[arrivedNode].visitedMask |= (1 << entryDir);
+    }
+
+    const char    candTurn[3]  = {'R', 'S', 'L'};
+    const bool    candAvail[3] = {branchRight, straightAhead, branchLeft};
+    const uint8_t candDir[3]   = {rightDir, inHead, leftDir};
+    bool blockRight = (consecutiveRightTurns >= 4) && (straightAhead || branchLeft);
+
+    char chosenTurn = 0;
+    if (arrivedNode < nodeCount) {
+      for (uint8_t k = 0; k < 3; k++) {
+        if (candAvail[k] && !(k == 0 && blockRight)) {
+          if ((nodes[arrivedNode].visitedMask & (1 << candDir[k])) == 0) {
+            chosenTurn = candTurn[k];
+            break;
+          }
+        }
+      }
+    }
+    if (chosenTurn == 0) {
+      for (uint8_t k = 0; k < 3; k++) {
+        if (candAvail[k] && !(k == 0 && blockRight)) {
+          chosenTurn = candTurn[k];
+          break;
+        }
+      }
+    }
+    if (chosenTurn == 0) {
+      chosenTurn = branchRight ? 'R' : (straightAhead ? 'S' : 'L');
+    }
+
+    uint8_t outDir = turnToDir(inHead, chosenTurn);
+    if (arrivedNode < nodeCount) {
+      nodes[arrivedNode].visitedMask |= (1 << outDir);
+    }
+
+    recordAndReduceTurn(arrivedNode, inHead, chosenTurn, outDir);
+    currentNode = arrivedNode;
+    lastExitDir = outDir;
+    currentHeading = outDir;
+    lastTurnWasBack = false;
+    consecutiveRightTurns = (chosenTurn == 'R') ? (consecutiveRightTurns + 1) : 0;
+
+    executeTurn(chosenTurn);
+    segmentStartTime = millis();
     return;
   }
 
