@@ -53,7 +53,7 @@ const bool INVERT_RIGHT_MOTOR = false;
 const int BASE_SPEED   = 145;
 const int MAX_SPEED    = 210;
 const int TURN_SPEED   = 125;
-const int INCH_TIME    = 120;
+const int INCH_TIME    = 200;
 
 float Kp = 0.048;
 float Ki = 0.00005;
