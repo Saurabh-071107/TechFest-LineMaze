@@ -22,15 +22,16 @@ uint8_t patternHistory[HISTORY_MAX] = {0};
 const uint8_t SENSOR_PINS[7] = {A0, A1, A2, A3, A4, A5, A6};
 const int SENSOR_WEIGHTS[7]  = {-3000, -2000, -1000, 0, 1000, 2000, 3000};
 
-const bool BLACK_LINE = true;
+bool isBlackLine = true;
 
-const uint16_t EEPROM_MAGIC = 0x5446;
+const uint16_t EEPROM_MAGIC = 0x5447;
 const int EEPROM_ADDR = 0;
 struct CalibData {
   uint16_t magic;
   int threshold[7];
   int minVal[7];
   int maxVal[7];
+  bool isBlackLine;
 };
 CalibData calib;
 
@@ -143,7 +144,7 @@ uint8_t preFinishStackLen = 0;
 uint8_t preFinishNode = 0;
 
 bool isOnLine(int raw, uint8_t idx) {
-  return BLACK_LINE ? (raw > sensorThreshold[idx]) : (raw < sensorThreshold[idx]);
+  return isBlackLine ? (raw > sensorThreshold[idx]) : (raw < sensorThreshold[idx]);
 }
 
 bool isSensorOnLine(uint8_t idx) {
@@ -454,6 +455,8 @@ void computeShortestPath() {
 
 void calibrateSensors() {
   int minVal[7], maxVal[7];
+  long sumVal[7] = {0};
+  long sampleCount = 0;
   for (int i = 0; i < 7; i++) {
     minVal[i] = 1023;
     maxVal[i] = 0;
@@ -467,7 +470,9 @@ void calibrateSensors() {
       int v = analogRead(SENSOR_PINS[i]);
       if (v < minVal[i]) minVal[i] = v;
       if (v > maxVal[i]) maxVal[i] = v;
+      sumVal[i] += v;
     }
+    sampleCount++;
 
     digitalWrite(PIN_LED, (millis() / 70) % 2);
     delay(2);
@@ -475,7 +480,20 @@ void calibrateSensors() {
 
   setMotors(0, 0);
 
+  // Auto-detect polarity: background covers >80% of arena area during rotation.
+  // White floor with black line: average < midpoint threshold -> isBlackLine = true.
+  // Black floor with white line: average > midpoint threshold -> isBlackLine = false.
+  long totalThreshold = 0;
+  long totalAverage = 0;
+  for (int i = 0; i < 7; i++) {
+    int thresh = (minVal[i] + maxVal[i]) / 2;
+    totalThreshold += thresh;
+    totalAverage += (sampleCount > 0) ? (sumVal[i] / sampleCount) : thresh;
+  }
+  isBlackLine = (totalAverage < totalThreshold);
+
   calib.magic = EEPROM_MAGIC;
+  calib.isBlackLine = isBlackLine;
   for (int i = 0; i < 7; i++) {
     calib.minVal[i] = minVal[i];
     calib.maxVal[i] = maxVal[i];
@@ -496,6 +514,23 @@ void calibrateSensors() {
   EEPROM.put(EEPROM_ADDR, calib);
 
   digitalWrite(PIN_LED, LOW);
+  delay(200);
+
+  // Optical confirmation of detected line mode:
+  // 1 long flash = Black Line on White Background
+  // 3 short flashes = White Line on Black Background
+  if (isBlackLine) {
+    digitalWrite(PIN_LED, HIGH);
+    delay(500);
+    digitalWrite(PIN_LED, LOW);
+  } else {
+    for (uint8_t k = 0; k < 3; k++) {
+      digitalWrite(PIN_LED, HIGH);
+      delay(100);
+      digitalWrite(PIN_LED, LOW);
+      delay(100);
+    }
+  }
   delay(300);
 }
 
@@ -689,7 +724,7 @@ int readSensors(bool &hasLeft, bool &hasRight, bool &hasCross, bool *allWhite = 
 
     if (isOnLine(raw, i)) {
       pattern |= (1 << (6 - i));
-      int activeVal = BLACK_LINE ? (raw - sensorThreshold[i]) : (sensorThreshold[i] - raw);
+      int activeVal = isBlackLine ? (raw - sensorThreshold[i]) : (sensorThreshold[i] - raw);
       weightedSum += (long)activeVal * SENSOR_WEIGHTS[i];
       totalActive += activeVal;
       activeCount++;
@@ -832,6 +867,7 @@ void setup() {
 
   EEPROM.get(EEPROM_ADDR, calib);
   if (calib.magic == EEPROM_MAGIC) {
+    isBlackLine = calib.isBlackLine;
     for (int i = 0; i < 7; i++) {
       initialMin[i] = calib.minVal[i];
       initialMax[i] = calib.maxVal[i];
@@ -846,6 +882,7 @@ void setup() {
       }
     }
   } else {
+    isBlackLine = true;
     for (int i = 0; i < 7; i++) {
       sensorThreshold[i] = 512;
       initialMin[i] = 0;

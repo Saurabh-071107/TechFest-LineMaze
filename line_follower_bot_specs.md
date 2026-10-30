@@ -18,7 +18,7 @@ graph TD
 
     subgraph Controller ["Processing & User Interface"]
         NANO["Arduino Nano (ATmega328P @ 16MHz)"]
-        EEPROM["Internal EEPROM (Calib 0x5446 + Path 0x5046)"]
+        EEPROM["Internal EEPROM (Calib 0x5447 + Path 0x5046)"]
         BTN["D10 Push-Button (INPUT_PULLUP)"]
         LED["D13 Status / Junction LED"]
     end
@@ -66,7 +66,8 @@ graph TD
 | **Actuators** | 2 × N20 Micro Metal Gearmotors | 6V rated, 300 RPM nominal speed |
 | **Control Input** | Push-Button on **Pin D10** (`PIN_BTN = 10`) | `1 Press` = Calibrate, `2 Presses` = Dry Run, `3 Presses` = Short Run |
 | **Chassis Total Length** | 21 cm | Front sensor tip to rear chassis boundary |
-| **Line Polarity** | Black line on white surface (Default) | Invertible in firmware (`BLACK_LINE = true/false`) |
+| **EEPROM Address Map** | Calibration `0x5447` + Path `0x5046` | Persists thresholds, `isBlackLine` polarity, and shortest path |
+| **Line Polarity** | Dual / Auto-Detected (`isBlackLine = true/false`) | Auto-detects White-on-Black vs Black-on-White during 360° calibration |
 | **Exploration Algorithm** | Loop-Aware Right-Priority Graph-DFS | `Right > Straight > Left > Back` preferring unvisited edges + 4-R cycle breaker |
 | **Shortest Path Engine** | Unified $\Delta H$ Stack Pruning + Dijkstra | Solves both dead-ends (`RBR->S`, `RBS->L`, etc.) and multi-path loops |
 | **Finish Detection** | 3 Consecutive Back-to-Back T-Junctions | Triggered when `tJunctionCount >= 3` within `maxTJunctionGap` |
@@ -201,9 +202,13 @@ flowchart LR
 
 ### Step-by-Step Arena Operation
 
-1. **`1 Press` — Calibrate Sensors (`calibrateSensors`):**
-   - Place the robot over the black line and white floor, then press `D10` **1 time**.
-   - After `0.4s`, the robot spins in place for `4 seconds` (`CALIB_SPIN_SPEED = 125`) while flashing `D13`, saves the calibrated thresholds to `EEPROM` (`0x5446`), and returns to Standby.
+1. **`1 Press` — Calibrate Sensors & Auto-Detect Polarity (`calibrateSensors`):**
+   - Place the robot over the arena (spanning both the line and the floor), then press `D10` **1 time**.
+   - After `0.4s`, the robot spins in place for `4 seconds` (`CALIB_SPIN_SPEED = 125`) while flashing `D13`.
+   - **Auto-Polarity Detection**: Measures background density vs threshold during rotation:
+     - **White Line on Black Background**: Confirmed with **3 short LED flashes** (`isBlackLine = false`).
+     - **Black Line on White Background**: Confirmed with **1 long LED flash** (`isBlackLine = true`).
+   - Saves calibrated thresholds and detected polarity to `EEPROM` (`0x5447`), and returns to Standby.
 2. **`2 Presses` — Start Dry Run (`MODE_DRY_RUN`, Base Speed `145`):**
    - Align the robot on the **Start Line** and press `D10` **2 times** (or press **1 time** immediately after calibration).
    - `D13` blinks **2 times**, waits `0.4s`, loads the `145` Dry-Run profile, and explores the maze.
