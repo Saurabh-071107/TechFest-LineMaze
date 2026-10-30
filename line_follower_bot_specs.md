@@ -163,29 +163,30 @@ The firmware automatically switches all speed, PID, filter, braking, and timing 
 | **`integralClamp`** | `±1500` | **`±1200`** | Anti-windup integral accumulator limit |
 | **`activeHistoryLen`** | `6` | **`5`** | Moving-average window length in `applyDataProtection()` |
 | **`slewDevMax` / `slewStep`** | `1800` / `1200` | **`2000` / `1400`** | Single-sample outlier slew-rate limiter |
-| **`inchTime` / `inchBrakeMs`** | `220 ms` / `25 ms` | **`180 ms` / `30 ms`** | Forward inching duration & reverse counter-brake pulse |
+| **`inchTime` / `inchBrakeMs`** | `160 ms` / `25 ms` | **`140 ms` / `30 ms`** | Forward inching duration & reverse counter-brake pulse |
 | **`pivot()` Timings** | `100 / 150 / 1200 / 30 / 30 ms` | **`85 / 130 / 1000 / 35 / 25 ms`** | Unstick / Clear S4 / Acquire S4 / Reverse Brake / Settle |
 | **`straightClearMs`** | `60 ms` | **`50 ms`** | Forward drive boost in `driveStraightPastJunction()` |
 | **`deadEndTimeoutMs`** | `100 ms` | **`80 ms`** | `allWhite` duration before triggering 180° turnaround |
-| **`minJunctionDebounce` / `rearmFallbackMs`** | `15 ms` / `120 ms` | **`12 ms` / `95 ms`** | Post-junction re-arming gates |
+| **`minJunctionDebounce` / `rearmFallbackMs`** | `15 ms` / `120 ms` | **`45 ms` / `160 ms`** | Post-junction re-arming gates (hardened against flutter) |
 | **`maxTJunctionGap`** | `750 ms` | **`650 ms`** | Maximum window between consecutive T-junctions for Finish Box |
 | **`sweep360Time` / `sweepBrakeMs`** | `3800 ms` / `28 ms` | **`3300 ms` / `32 ms`** | 360° line search timeout and lock counter-brake |
 | **`odomDivisor`** | `40 ms/unit` | **`33 ms/unit`** | Time-odometry divisor for graph coordinate mapping |
 
 ### 5.2 Graph-DFS Exploration & Shortest-Path Solver
 
-1. **Compass Heading & Time-Odometry Graph (`nodes[28]`):**
-   - Tracks drift-free compass heading `currentHeading` $\in \{0=\text{N}, 1=\text{E}, 2=\text{S}, 3=\text{W}\}$ and estimated grid coordinates `(curX, curY)` using elapsed segment travel time `segCost = (millis() - segmentStartTime) / odomDivisor`.
-   - `findOrCreateNode()` matches revisited junctions within `SNAP_RADIUS = 12` when topology overlaps, snapping `(curX, curY)` to cancel drift and linking bidirectional weighted edges.
-   - After any 180° dead-end turnaround (`recordDeadEnd()`), `lastTurnWasBack = true` guarantees the next junction snaps directly back to `currentNode`.
-2. **Loop-Safe Right-Priority Selection:**
-   - At every junction in `MODE_DRY_RUN`, available branches are evaluated in **`Right > Straight > Left`** order:
-     - **Pass 1:** Selects the highest-priority **unvisited** exit (`visitedMask`).
-     - **Pass 2:** Falls back to standard `R > S > L` if all exits have been visited.
-     - **Cycle-Breaker Guard:** If `consecutiveRightTurns >= 4` ($+360^\circ$ loop) and Straight or Left is available, Right is blocked to break out of closed island loops.
-3. **In-Flight Reduction (`recordAndReduceTurn` & `collapseBStack`) + Dijkstra (`computeShortestPath`):**
-   - Collapses dead-end `'B'` sequences (`RBR -> S`, `RBS -> L`, `SBR -> L`, `LBR -> B`, `RBL -> B`, `SBS -> B`) and revisited-node sub-loops in real time using `dirsToTurn(origIn, curOut)`.
-   - At the Finish Box, `computeShortestPath()` extracts the pruned stack up to `preFinishStackLen` (ignoring the Finish Box bars themselves), runs Dijkstra across `nodes[]` from `Node 0` to `preFinishNode` to upgrade `shortestPath[]` if a faster multi-path shortcut exists, and persists the result to `EEPROM` (`StoredPath`, magic `0x5046`).
+1. **Compass Heading & Topological Node Mapping (`nodes[28]`):**
+   - Tracks drift-free compass heading `currentHeading` $\in \{0=\text{N}, 1=\text{E}, 2=\text{S}, 3=\text{W}\}$ and estimated grid coordinates `(curX, curY)`.
+   - `findOrCreateNode()` snaps revisited junctions within a tight `SNAP_RADIUS = 4` (preventing adjacent junctions from collapsing into `Node 0`) and links bidirectional weighted edges.
+   - When backtracking (`lastTurnWasBack = true`), coordinates and node identity instantly snap back to `currentNode`.
+2. **Deterministic Right-Priority Selection (`Right > Straight > Left > Back`):**
+   - When approaching a junction, side-branch sensor readings are isolated from the PID error so a left/right branch never yanks the robot off the center line before `inchTime`.
+   - `straightAhead` is sampled both during the final quarter of `inchTime` (after clearing the crossbar) and after braking across `S2–S6`.
+   - At every junction in `MODE_DRY_RUN`, branches are selected in strict **`Right > Straight > Left > Back`** order (with a 4-consecutive-Right island cycle breaker). By 2D planar geometry, returning $180^\circ$ from any dead-end branch automatically advances the local `R > S > L` frame through `Right -> Straight -> Left -> Parent (Backtrack)`.
+3. **Dual Shortest-Path Engine (Cascading LSRB + Topological Dijkstra):**
+   - **Cascading LSRB Reduction:** Every dead-end turnaround simplifies in real time (`RBR->S`, `RBS->L`, `SBR->L`, `SBS->B`, `LBL->S`, etc.) and cascades recursively without leaving residual `'B'` turns.
+   - **40 cm End Box Detection & Parking (`isEndBoxActive()`):** After `inchTime` (~4.5 cm forward), normal ~3 cm junctions have cleared the outer sensors, whereas the solid 40 cm End Box keeps Left + Center + Right ($\ge 5$ sensors) active. The robot drives an additional `140 ms` (~4.5 cm deeper into the 40 cm box) while verifying sensor persistence ($\ge 20/28$ samples), brakes inside the box, latches `preFinishStackLen = stackLen`, and triggers `finishAndStop()`. (Also retains 3-consecutive-T-junction detection as a secondary fallback.)
+   - **At the Finish Box:** `computeShortestPath()` freezes the pre-finish stack, executes multi-pass `reducePath()`, and runs Dijkstra across `nodes[]` from `Node 0` to `preFinishNode`. If Dijkstra discovers a shorter topological shortcut, it upgrades `shortestPath[]`. The result is safely persisted to `EEPROM` (`0x5046`).
+   - **Speed-Run Safeguard:** If Mode 3 is selected with an empty path, the robot flashes 5 warning blinks and halts in Standby.
 
 ---
 
@@ -212,10 +213,11 @@ flowchart LR
 2. **`2 Presses` — Start Dry Run (`MODE_DRY_RUN`, Base Speed `145`):**
    - Align the robot on the **Start Line** and press `D10` **2 times** (or press **1 time** immediately after calibration).
    - `D13` blinks **2 times**, waits `0.4s`, loads the `145` Dry-Run profile, and explores the maze.
-   - Upon detecting **3 consecutive T-junctions** at the Finish Box, the robot halts, computes and saves `shortestPath[]` to `EEPROM`, blinks `D13` **6 times**, and enters Standby.
+   - Upon entering the **40 cm End Box** (or detecting 3 consecutive T-junctions), the robot drives inside the box, halts, computes and saves `shortestPath[]` to `EEPROM`, blinks `D13` **6 times**, and enters Standby.
 3. **`3 Presses` — Start Final Short Run (`MODE_SPEED_RUN`, Base Speed `175`):**
    - Place the robot back on the **Start Line** and press `D10` **3 times** (or press **1 time** right after the Dry Run finishes).
-   - `D13` blinks **3 times**, waits `0.4s`, loads the `175` Final-Run profile, and executes `shortestPath[]` directly to the Finish Box.
+   - If no valid path is stored, `D13` flashes **5 rapid warning blinks** and stays in Standby.
+   - If valid, `D13` blinks **3 times**, waits `0.4s`, loads the `175` Final-Run profile, and executes `shortestPath[]` directly to the Finish Box.
 4. **In-Run Emergency Stop / Reset:**
    - Pressing `D10` at any time while the robot is moving immediately stops the motors and returns to Standby (`waitForButtonCommand`).
    - Because both calibration and `shortestPath[]` are stored in `EEPROM`, you can power-cycle the robot at any time and press `D10` **3 times** to re-run the saved shortest path directly.
