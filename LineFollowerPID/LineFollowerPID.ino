@@ -58,7 +58,7 @@ const int CALIB_SPIN_SPEED = 125;
 int baseSpeed   = 145;
 int maxSpeed    = 210;
 int turnSpeed   = 125;
-int inchTime    = 220;
+int inchTime    = 250;
 uint8_t inchBrakeMs = 25;
 
 float Kp = 0.048f;
@@ -73,12 +73,12 @@ uint8_t pivotUnstickMs  = 100;
 uint8_t pivotClearMs    = 150;
 uint16_t pivotFindMs    = 1200;
 uint8_t pivotBrakeMs    = 30;
-uint8_t pivotSettleMs   = 30;
+uint8_t pivotSettleMs   = 5;
 uint8_t straightClearMs = 60;
 
 unsigned long minJunctionDebounce = 15;
 unsigned long rearmFallbackMs     = 120;
-unsigned long deadEndTimeoutMs    = 100;
+unsigned long deadEndTimeoutMs    = 35;
 unsigned long sweep360Time        = 3800;
 uint8_t sweepBrakeMs              = 28;
 uint8_t odomDivisor               = 40;
@@ -147,6 +147,11 @@ bool isOnLine(int raw, uint8_t idx) {
   return isBlackLine ? (raw > sensorThreshold[idx]) : (raw < sensorThreshold[idx]);
 }
 
+int calcThreshold(int minV, int maxV) {
+  // ponytail: 42% white-biased threshold on black floor rejects surface glare without narrowing 90° corners
+  return isBlackLine ? ((minV + maxV) / 2) : (minV + (int)(((long)(maxV - minV) * 42L) / 100L));
+}
+
 bool isSensorOnLine(uint8_t idx) {
   return isOnLine(analogRead(SENSOR_PINS[idx]), idx);
 }
@@ -176,15 +181,11 @@ void setMotors(int leftSpeed, int rightSpeed) {
 }
 
 void blinkJunction() {
-  for (uint8_t i = 0; i < 3; i++) {
-    digitalWrite(PIN_LED, HIGH);
-    delay(25);
-    digitalWrite(PIN_LED, LOW);
-    delay(20);
-  }
+  digitalWrite(PIN_LED, HIGH); // ponytail: zero-delay LED indicator avoids 135ms motor stop at turns
 }
 
 void resetTrackingState() {
+  digitalWrite(PIN_LED, LOW);
   integral = 0;
   lastError = 0;
   lastJunctionTime = millis();
@@ -212,11 +213,11 @@ void applySpeedProfile(BotMode mode) {
     pivotClearMs        = 150;
     pivotFindMs         = 1200;
     pivotBrakeMs        = 30;
-    pivotSettleMs       = 30;
+    pivotSettleMs       = 5;
     straightClearMs     = 60;
     minJunctionDebounce = 15;
     rearmFallbackMs     = 120;
-    deadEndTimeoutMs    = 100;
+    deadEndTimeoutMs    = 35;
     maxTJunctionGap     = 750;
     sweep360Time        = 3800;
     sweepBrakeMs        = 28;
@@ -238,11 +239,11 @@ void applySpeedProfile(BotMode mode) {
     pivotClearMs        = 130;
     pivotFindMs         = 1000;
     pivotBrakeMs        = 35;
-    pivotSettleMs       = 25;
+    pivotSettleMs       = 5;
     straightClearMs     = 50;
-    minJunctionDebounce = 45;
-    rearmFallbackMs     = 160;
-    deadEndTimeoutMs    = 80;
+    minJunctionDebounce = 15;
+    rearmFallbackMs     = 110;
+    deadEndTimeoutMs    = 30;
     maxTJunctionGap     = 650;
     sweep360Time        = 3300;
     sweepBrakeMs        = 32;
@@ -369,11 +370,13 @@ void recordAndReduceTurn(uint8_t nodeId, uint8_t inHead, char turn, uint8_t outD
 
 void recordDeadEnd() {
   if (botMode != MODE_DRY_RUN) return;
-  if (stackLen < MAX_PATH_LEN) {
-    stackNode[stackLen] = 0xFF;
-    stackInHeading[stackLen] = currentHeading;
-    stackTurn[stackLen] = 'B';
-    stackLen++;
+  if (stackLen == 0 || stackTurn[stackLen - 1] != 'B') {
+    if (stackLen < MAX_PATH_LEN) {
+      stackNode[stackLen] = 0xFF;
+      stackInHeading[stackLen] = currentHeading;
+      stackTurn[stackLen] = 'B';
+      stackLen++;
+    }
   }
   currentHeading = (currentHeading + 2) & 3;
   lastTurnWasBack = true;
@@ -430,66 +433,7 @@ void computeShortestPath() {
     }
   }
 
-  // Topological Dijkstra across nodes[]
-  if (preFinishNode > 0 && preFinishNode < nodeCount) {
-    uint16_t dist[MAX_NODES];
-    uint8_t prevNode[MAX_NODES];
-    uint8_t prevDir[MAX_NODES];
-    bool used[MAX_NODES];
-
-    for (uint8_t i = 0; i < nodeCount; i++) {
-      dist[i] = 0xFFFF;
-      prevNode[i] = 0xFF;
-      prevDir[i] = 0;
-      used[i] = false;
-    }
-    dist[0] = 0;
-
-    for (uint8_t step = 0; step < nodeCount; step++) {
-      uint8_t u = 0xFF;
-      uint16_t best = 0xFFFF;
-      for (uint8_t i = 0; i < nodeCount; i++) {
-        if (!used[i] && dist[i] < best) {
-          best = dist[i];
-          u = i;
-        }
-      }
-      if (u == 0xFF || u == preFinishNode) break;
-      used[u] = true;
-
-      for (uint8_t d = 0; d < 4; d++) {
-        uint8_t v = nodes[u].neighbor[d];
-        if (v < nodeCount && !used[v]) {
-          uint16_t nd = dist[u] + nodes[u].edgeCost[d];
-          if (nd < dist[v]) {
-            dist[v] = nd;
-            prevNode[v] = u;
-            prevDir[v] = d;
-          }
-        }
-      }
-    }
-
-    if (dist[preFinishNode] != 0xFFFF) {
-      uint8_t revDirs[MAX_NODES];
-      uint8_t count = 0;
-      uint8_t cur = preFinishNode;
-      while (cur != 0 && cur < nodeCount && count < MAX_NODES) {
-        revDirs[count] = prevDir[cur];
-        cur = prevNode[cur];
-        count++;
-      }
-      if (cur == 0 && count >= 2 && (count - 1 < shortestPathLen || shortestPathLen == 0)) {
-        shortestPathLen = 0;
-        uint8_t inDir = revDirs[count - 1];
-        for (int8_t k = (int8_t)count - 2; k >= 0; k--) {
-          uint8_t outDir = revDirs[k];
-          shortestPath[shortestPathLen++] = dirsToTurn(inDir, outDir);
-          inDir = outDir;
-        }
-      }
-    }
-  }
+  // ponytail: pure LSRB guarantees 1-to-1 junction parity; removed Dijkstra override that dropped the final turn at preFinishNode
   saveShortestPathToEEPROM();
 }
 
@@ -537,7 +481,7 @@ void calibrateSensors() {
   for (int i = 0; i < 7; i++) {
     calib.minVal[i] = minVal[i];
     calib.maxVal[i] = maxVal[i];
-    calib.threshold[i] = (minVal[i] + maxVal[i]) / 2;
+    calib.threshold[i] = calcThreshold(minVal[i], maxVal[i]);
 
     initialMin[i] = minVal[i];
     initialMax[i] = maxVal[i];
@@ -762,10 +706,11 @@ void turnAround180() {
     delay(1);
   }
 
-  setMotors(-leftSpeed / 2, -rightSpeed / 2);
-  delay(pivotBrakeMs);
+  // ponytail: full-torque reverse brake + settle arrests higher 180° angular momentum
+  setMotors(-leftSpeed, -rightSpeed);
+  delay(pivotBrakeMs + 15);
   setMotors(0, 0);
-  delay(pivotSettleMs);
+  delay(25);
 
   resetTrackingState();
 }
@@ -815,8 +760,8 @@ int readSensors(bool &hasLeft, bool &hasRight, bool &hasCross, bool *allWhite = 
     return lastError;
   }
 
-  bool leftBranch  = ((pattern & 0b1000000) != 0) && ((pattern & 0b0110000) != 0);
-  bool rightBranch = ((pattern & 0b0000001) != 0) && ((pattern & 0b0000110) != 0);
+  bool leftBranch  = (pattern & 0b1110000) == 0b1110000;
+  bool rightBranch = (pattern & 0b0000111) == 0b0000111;
 
   hasCross = (leftBranch && rightBranch) || (pattern == 0b1111111) || (pattern == 0b1110111) ||
              (activeCount >= 5 && ((pattern & 0b1000000) != 0) && ((pattern & 0b0000001) != 0));
@@ -876,8 +821,8 @@ int applyDataProtection(int rawError, uint8_t rawPattern, bool &junctionSupporte
   uint8_t junctionVotes = 0;
   for (uint8_t i = 0; i < errorHistCount; i++) {
     uint8_t p = patternHistory[i];
-    bool hasLeftFeature  = ((p & 0b1000000) != 0) && ((p & 0b0110000) != 0);
-    bool hasRightFeature = ((p & 0b0000001) != 0) && ((p & 0b0000110) != 0);
+    bool hasLeftFeature  = (p & 0b1110000) == 0b1110000;
+    bool hasRightFeature = (p & 0b0000111) == 0b0000111;
     if (hasLeftFeature || hasRightFeature || (p == 0b1111111)) {
       junctionVotes++;
     }
@@ -888,6 +833,7 @@ int applyDataProtection(int rawError, uint8_t rawPattern, bool &junctionSupporte
 }
 
 bool calibrationAllowed(int error, uint8_t pattern, bool hasLeft, bool hasRight, bool hasCross, bool allWhite) {
+  if (!isBlackLine) return false; // ponytail: skip online drift on black floor so threshold never creeps toward background
   if (allWhite || pattern == 0) return false;
 
   if (hasLeft || hasRight || hasCross) return false;
@@ -953,14 +899,14 @@ void setup() {
     for (int i = 0; i < 7; i++) {
       initialMin[i] = calib.minVal[i];
       initialMax[i] = calib.maxVal[i];
-      initialThreshold[i] = calib.threshold[i];
+      initialThreshold[i] = calcThreshold(calib.minVal[i], calib.maxVal[i]);
 
       currentMin[i] = (float)calib.minVal[i];
       currentMax[i] = (float)calib.maxVal[i];
-      sensorThreshold[i] = calib.threshold[i];
+      sensorThreshold[i] = initialThreshold[i];
 
       for (int s = 0; s < 3; s++) {
-        rawHistory[i][s] = calib.threshold[i];
+        rawHistory[i][s] = initialThreshold[i];
       }
     }
   } else {
@@ -1014,13 +960,16 @@ void loop() {
     }
 
     if (millis() - lostLineStart > deadEndTimeoutMs) {
+      setMotors(-baseSpeed / 2, -baseSpeed / 2);
+      delay(inchBrakeMs);
+      setMotors(0, 0);
       turnAround180();
       recordDeadEnd();
       lostLineStart = 0;
       return;
     }
 
-    setMotors(baseSpeed / 2, baseSpeed / 2);
+    setMotors(baseSpeed, baseSpeed);
     return;
   }
   lostLineStart = 0;
@@ -1052,16 +1001,16 @@ void loop() {
     junctionClearCounter = 0;
     lastJunctionTime = millis();
 
-    bool branchRight = hasRight || hasCross || confR || confCross || (isSensorOnLine(6) && isSensorOnLine(5));
-    bool branchLeft  = hasLeft  || hasCross || confL || confCross || (isSensorOnLine(0) && isSensorOnLine(1));
+    bool branchRight = hasRight || hasCross || confR || confCross || (isSensorOnLine(6) && isSensorOnLine(5) && isSensorOnLine(4));
+    bool branchLeft  = hasLeft  || hasCross || confL || confCross || (isSensorOnLine(0) && isSensorOnLine(1) && isSensorOnLine(2));
 
     setMotors(baseSpeed, baseSpeed);
     unsigned long tInch = millis();
     bool straightDuringLateInch = false;
     while (millis() - tInch < (unsigned long)inchTime) {
       unsigned long elapsed = millis() - tInch;
-      if (isSensorOnLine(6) && isSensorOnLine(5)) branchRight = true;
-      if (isSensorOnLine(0) && isSensorOnLine(1)) branchLeft  = true;
+      if (isSensorOnLine(6) && isSensorOnLine(5) && isSensorOnLine(4)) branchRight = true;
+      if (isSensorOnLine(0) && isSensorOnLine(1) && isSensorOnLine(2)) branchLeft  = true;
       if (elapsed >= (unsigned long)((inchTime * 3) / 4)) {
         if (isSensorOnLine(2) || isSensorOnLine(3) || isSensorOnLine(4)) {
           straightDuringLateInch = true;
@@ -1115,6 +1064,7 @@ void loop() {
       }
     } else {
       tJunctionCount = 0;
+      preFinishStackLen = 0;
     }
 
     bool straightAhead = straightDuringLateInch ||
@@ -1224,6 +1174,7 @@ void loop() {
 
   if (tJunctionCount > 0 && (millis() - lastTJunctionTime > maxTJunctionGap)) {
     tJunctionCount = 0;
+    preFinishStackLen = 0;
   }
 
   if (calibrationAllowed(error, pattern, hasLeft, hasRight, hasCross, allWhite)) {
